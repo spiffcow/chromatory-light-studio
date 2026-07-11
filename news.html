@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Paint Buddy — News</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <style>
+        * { box-sizing: border-box; }
+        body { background: #14171a; color: #ddd; font-family: system-ui, sans-serif; margin: 0; }
+        header { padding: 14px 18px 4px; }
+        h1 { font-size: 20px; margin: 0; }
+        main { max-width: 760px; margin: 0 auto; padding: 0 18px 40px; }
+        .muted { color: #98a4ae; } .small { font-size: 13px; }
+        .card { background: #1c2126; border: 1px solid #2a3138; border-radius: 10px; padding: 12px 16px; margin: 12px 0; }
+        .card.note { border-color: #6b5a2a; background: #211f16; }
+        h2 { font-size: 15px; margin: 4px 0 8px; }
+        li { margin: 6px 0; }
+        a { color: #7fb4ff; }
+        kbd { background: #2a3138; border-radius: 4px; padding: 0 5px; font-size: 12px; }
+        footer { margin-top: 28px; }
+    </style>
+</head>
+<body>
+<header>
+    <h1>Paint Buddy — News</h1>
+    <p class="muted small"><a href="./">← Light Studio</a> · <a href="terms.html">Terms &amp; Conditions</a></p>
+</header>
+<main>
+    <div class="card note">
+        <h2>A note from the developer — July 10, 2026</h2>
+        <p>Hi all! I hope you're enjoying the product. I know most of you found this through
+        r/miniaturepainting and might be wondering why I haven't responded to your messages. In short,
+        one of the moderators on another painting subreddit objected to my work, permabanned me, and
+        somehow convinced Reddit to temporarily suspend my account. I don't want to get into the
+        details, but if you read the new <a href="terms.html">terms and conditions</a> you can
+        probably piece things together.</p>
+        <p>Anyway, I'm planning lots of exciting new features in the coming days and weeks. I also
+        want to give a special shoutout to u/ben8192 for his recommendations on locking specular
+        highlights and setting shadow colors.</p>
+    </div>
+
+    <div class="card">
+        <h2>Release notes — July 10, 2026</h2>
+        <ul class="small">
+            <li><b>Lock highlights.</b> Freeze specular reflections as seen from your chosen painting
+                view, then orbit freely — the hotspots stay where you'll paint them.</li>
+            <li><b>Shadow colour &amp; strength.</b> Shade toward a colour (try a cool blue-violet)
+                instead of black, and back the occlusion off to taste.</li>
+            <li><b>Light management.</b> Click a light in the panel to select it in the view; switch
+                lights off without removing them; clone a light with all its settings;
+                <kbd>Delete</kbd> removes and <kbd>Ctrl</kbd>+<kbd>Z</kbd> undoes.</li>
+            <li><b>Stability.</b> Fixed a crash with multiple large light sources, and light handles
+                can no longer vanish under the table.</li>
+        </ul>
+    </div>
+
+    <footer class="muted small">
+        Part of <b>Paint Buddy</b>, the local-first assistant for miniature painters.
+        Use is subject to the <a href="terms.html">Terms &amp; Conditions</a>.
+    </footer>
+</main>
+<script>
+    // Seeing this page clears the "unread" badge on the studio pages.
+    localStorage.setItem('pb-news-seen', '2026-07-10');
+</script>
+</body>
+</html>

@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<!--
+  Paint Buddy Light Studio — standalone edition.
+  A free, fully client-side light-placement reference for miniature painters (NMM/OSL):
+  load the STL you print from, place lights, pick a metal or paint look, and read the
+  highlights off the render. Nothing is uploaded anywhere — the STL never leaves your browser,
+  so there is no file size limit beyond your machine's memory.
+
+  This page is a thin shell around the SAME renderer module the Paint Buddy app uses
+  (js/lightstudio.js); the deploy script copies that module and the vendored three.js libs
+  from the main source tree, so the two never drift.
+-->
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Paint Buddy — Light Studio</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <script type="importmap">{ "imports": { "three": "./lib/three/three.module.js" } }</script>
+    <style>
+        * { box-sizing: border-box; }
+        body { background: #14171a; color: #ddd; font-family: system-ui, sans-serif; margin: 0; }
+        header { padding: 14px 18px 4px; }
+        h1 { font-size: 20px; margin: 0; }
+        .muted { color: #98a4ae; } .small { font-size: 12px; }
+        main { max-width: 1060px; margin: 0 auto; padding: 0 18px 40px; }
+        #canvas { width: 100%; aspect-ratio: 4/3; border-radius: 10px; background: #101315; touch-action: none; display: block; }
+        #drop { border: 2px dashed #2d6cdf; border-radius: 10px; padding: 36px 16px; text-align: center; margin: 12px 0; cursor: pointer; }
+        #drop.hover { background: #1a2436; }
+        h2 { font-size: 15px; margin: 16px 0 6px; }
+        .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+        button {
+            background: #232a31; color: #ddd; border: 1px solid #2a3138; border-radius: 8px;
+            padding: 7px 12px; font-size: 14px; cursor: pointer;
+        }
+        button.primary { background: #2d6cdf; border-color: #2d6cdf; color: #fff; }
+        button.active { background: #2d6cdf; border-color: #2d6cdf; color: #fff; }
+        button.ghost { background: none; }
+        input[type="range"] { accent-color: #2d6cdf; }
+        label { font-size: 13px; color: #98a4ae; display: inline-flex; gap: 6px; align-items: center; }
+        .card { background: #1c2126; border: 1px solid #2a3138; border-radius: 10px; padding: 10px 12px; margin: 6px 0; }
+        .card.selected { border-color: #2d6cdf; }
+        a.unread { color: #ffd27a; }
+        a.unread::after { content: ' ●'; color: #e0a93d; }
+        .spread { justify-content: space-between; }
+        a { color: #7fb4ff; }
+        footer { margin-top: 28px; }
+    </style>
+</head>
+<body>
+<header>
+    <h1>Paint Buddy — Light Studio</h1>
+    <p class="muted small">Plan light placement for NMM and OSL: load the STL you print from, place
+        lights, pick a look, and copy the highlights. Runs entirely in your browser — the model is
+        never uploaded, so any size your machine can handle is fine.
+        · <a href="news.html" id="newsLink">🔔 News</a> · <a href="terms.html">Terms</a></p>
+</header>
+<main>
+    <div id="drop">
+        <b>Drop an STL here</b> or <a href="#" id="pick">choose a file</a>
+        <div class="muted small" id="loadstatus">binary or ASCII STL · stays on your device</div>
+        <input type="file" id="file" accept=".stl" style="display:none" />
+    </div>
+
+    <canvas id="canvas"></canvas>
+    <div class="row">
+        <button class="ghost" id="lockSpec"
+            title="Freeze the highlights as seen from THIS view — orbit freely, they stay put (that's where you'll paint them). Click again to unfreeze.">🔒 Lock highlights</button>
+        <span class="muted small">Orbit with drag/pinch · wheel zooms · tap a handle for X/Y/Z arrows ·
+            <b>Del</b> removes the selected light · <b>Ctrl+Z</b> undoes.</span>
+        <span class="muted small" style="margin-left:auto">Sideways model?</span>
+        <button class="ghost" data-orient="x,1" title="Tip forward">⤵</button>
+        <button class="ghost" data-orient="x,-1" title="Tip back">⤴</button>
+        <button class="ghost" data-orient="y,1" title="Spin a quarter turn">↻</button>
+        <button class="ghost" data-orient="z,1" title="Roll left">⟲</button>
+        <button class="ghost" data-orient="z,-1" title="Roll right">⟳</button>
+        <button class="ghost" id="orientReset" title="Back to how it loaded">Reset</button>
+    </div>
+
+    <h2>Look</h2>
+    <div class="muted small">Responds to your lights:</div>
+    <div class="row" id="looks-live"></div>
+    <div class="muted small">Fixed idealized reference (ignores lights — the shapes to copy):</div>
+    <div class="row" id="looks-fixed"></div>
+    <div class="row">
+        <label>Color <input type="color" id="color" value="#c8ccd2" /></label>
+        <label id="bandsRow" style="display:none">Bands <input type="range" id="bands" min="2" max="8" step="1" value="4" /></label>
+    </div>
+    <div class="row" id="pbrRow">
+        <label>Metal <input type="range" id="metal" min="0" max="1" step="0.05" value="1" /></label>
+        <label>Rough <input type="range" id="rough" min="0.02" max="1" step="0.02" value="0.3" /></label>
+    </div>
+
+    <h2>Lights</h2>
+    <div class="row">
+        <button data-preset="zenithal">Zenithal</button>
+        <button data-preset="keyrim">Key + rim</button>
+        <button data-preset="candle">Candle-low (fire gradient)</button>
+        <button class="ghost" id="addPoint">+ Point</button>
+        <button class="ghost" id="addDir">+ Directional</button>
+    </div>
+    <div class="row">
+        <label>Ambient <input type="range" id="ambient" min="0" max="0.8" step="0.02" value="0.18" /></label>
+        <span class="muted small">room light — brighten to inspect, dim for dramatic OSL</span>
+    </div>
+    <div class="row">
+        <label>Floor <input type="color" id="floor" value="#4a4136" /></label>
+        <span class="muted small">the table the mini stands on — its colour tints every light's bounce</span>
+    </div>
+    <div class="row">
+        <label><input type="checkbox" id="shadows" checked /> Shadows</label>
+        <span class="muted small">the model blocks light — turn off on weak GPUs</span>
+    </div>
+    <div class="row" id="shadowTintRow">
+        <label>Shadow colour <input type="color" id="shadowTint" value="#000000" /></label>
+        <label>Strength <input type="range" id="shadowStrength" min="0" max="1" step="0.05" value="1" /></label>
+        <span class="muted small">painters shade toward a colour, not black — try a cool blue-violet</span>
+    </div>
+    <div id="lights"></div>
+
+    <h2>Rigs &amp; capture</h2>
+    <div class="row">
+        <button id="saveRig">💾 Save rig…</button>
+        <button id="loadRig">📂 Load rig</button>
+        <input type="file" id="rigFile" accept=".json" style="display:none" />
+        <button class="primary" id="shot">📸 Save render (PNG)</button>
+    </div>
+
+    <footer class="muted small">
+        Part of <b>Paint Buddy</b>, the local-first assistant for miniature painters.
+        Free to use; your files stay on your device.<br />
+        Sample model: <a href="https://commons.wikimedia.org/wiki/File:Bust_of_Emperor_Caracalla.stl"
+        target="_blank" rel="noopener">Bust of Emperor Caracalla</a> — CC0 3D scan via Wikimedia Commons.
+    </footer>
+</main>
+
+<script type="module">
+    import * as studio from './js/lightstudio.js';
+
+    const $ = id => document.getElementById(id);
+    const status = $('loadstatus');
+
+    studio.init($('canvas'));
+
+    // ---- STL loading (file picker + drag & drop, no size limit — it never leaves the client)
+    async function loadFile(file) {
+        if (!file) return;
+        status.textContent = `reading ${file.name} (${(file.size / 1048576).toFixed(1)} MB)…`;
+        try {
+            const bytes = new Uint8Array(await file.arrayBuffer());
+            status.textContent = 'parsing…';
+            await new Promise(r => setTimeout(r, 30)); // let the status paint before the parse blocks
+            const triangles = studio.loadStl(bytes);
+            status.textContent = `${file.name} — ${triangles.toLocaleString()} triangles`;
+            refreshLights();
+        } catch (error) {
+            status.textContent = `couldn't read that STL: ${error.message}`;
+        }
+    }
+    $('pick').addEventListener('click', event => { event.preventDefault(); $('file').click(); });
+    $('file').addEventListener('change', () => loadFile($('file').files[0]));
+    const drop = $('drop');
+    drop.addEventListener('click', event => { if (event.target.id !== 'pick') $('file').click(); });
+    drop.addEventListener('dragover', event => { event.preventDefault(); drop.classList.add('hover'); });
+    drop.addEventListener('dragleave', () => drop.classList.remove('hover'));
+    drop.addEventListener('drop', event => {
+        event.preventDefault();
+        drop.classList.remove('hover');
+        loadFile(event.dataTransfer.files[0]);
+    });
+
+    // ---- Looks (single source: studio.LOOKS)
+    let currentLook = 'silvernmm';
+    const appearance = { shader: 'pbr', matcap: 'chrome', toonBands: 4, color: '#c8ccd2',
+        metalness: 1.0, roughness: 0.3, clearcoat: 0, envIntensity: 0.75 };
+
+    function renderLookButtons() {
+        for (const [host, fixed] of [[$('looks-live'), false], [$('looks-fixed'), true]]) {
+            host.innerHTML = '';
+            for (const [key, look] of Object.entries(studio.LOOKS)) {
+                if (look.fixedReference !== fixed) continue;
+                const button = document.createElement('button');
+                button.textContent = look.label;
+                button.className = key === currentLook ? 'active' : '';
+                button.addEventListener('click', () => applyLook(key));
+                host.appendChild(button);
+            }
+        }
+    }
+
+    function applyLook(key) {
+        currentLook = key;
+        Object.assign(appearance, studio.LOOKS[key].appearance);
+        if (studio.LOOKS[key].appearance.color) $('color').value = studio.LOOKS[key].appearance.color;
+        appearance.color = $('color').value;
+        $('metal').value = appearance.metalness ?? 1;
+        $('rough').value = appearance.roughness ?? 0.3;
+        $('bands').value = appearance.toonBands ?? 4;
+        $('bandsRow').style.display = appearance.shader === 'toon' ? '' : 'none';
+        $('pbrRow').style.display = appearance.shader === 'pbr' ? '' : 'none';
+        studio.setAppearance(appearance);
+        renderLookButtons();
+        syncLockButton();
+    }
+
+    function pushAppearance() {
+        appearance.color = $('color').value;
+        appearance.metalness = parseFloat($('metal').value);
+        appearance.roughness = parseFloat($('rough').value);
+        appearance.toonBands = parseInt($('bands').value, 10);
+        studio.setAppearance(appearance);
+    }
+    for (const id of ['color', 'metal', 'rough', 'bands']) $(id).addEventListener('input', pushAppearance);
+
+    // ---- Lights
+    function refreshLights() {
+        const list = JSON.parse(studio.getLightsJson());
+        const host = $('lights');
+        host.innerHTML = '';
+        for (const light of list) {
+            const card = document.createElement('div');
+            card.className = light.selected ? 'card selected' : 'card';
+            const gradient = light.type === 'point' ? `
+                <div class="row">
+                    <label>Falloff <input type="range" data-id="${light.id}" data-k="decay" min="0.5" max="3" step="0.1" value="${light.decay}"
+                        title="how fast it dims with distance — high for candles, low for lanterns"></label>
+                    <label><input type="checkbox" data-id="${light.id}" data-k="farTint" ${light.farColor ? 'checked' : ''}> Far tint</label>
+                    ${light.farColor ? `
+                        <input type="color" data-id="${light.id}" data-k="farColor" value="${light.farColor}">
+                        <label>Gradient start <input type="range" data-id="${light.id}" data-k="gradientStart" min="0.08" max="1" step="0.02" value="${light.gradientStart}"
+                            title="where the near colour hands over to the far tint"></label>` : ''}
+                </div>` : '';
+            const sizeControl = light.type === 'point' ? `
+                    <label>Size <input type="range" data-id="${light.id}" data-k="size" min="0" max="24" step="1" value="${light.size}"
+                        title="physical size of the source — bigger gives broader highlights and softer shadow edges"></label>` : '';
+            const bounceRow = `
+                <div class="row">
+                    ${sizeControl}
+                    <label><input type="checkbox" data-id="${light.id}" data-k="bounceOn" ${light.bounceStrength > 0 ? 'checked' : ''}> Bounce</label>
+                    ${light.bounceStrength > 0 ? `
+                        <input type="range" data-id="${light.id}" data-k="bounceStrength" min="0.05" max="1" step="0.05" value="${light.bounceStrength}"
+                            title="how much bounces back up off the floor — the secondary NMM highlight (tinted by the Floor colour)">` : ''}
+                </div>`;
+            card.innerHTML = `
+                <div class="row spread">
+                    <span class="muted small" data-id="${light.id}" data-k="select" style="cursor:pointer"
+                        title="select this light in the view (shows its move arrows)">${light.selected ? '▶ ' : ''}${light.type} light</span>
+                    <div class="row">
+                        <input type="color" data-id="${light.id}" data-k="color" value="${light.color}">
+                        <input type="range" data-id="${light.id}" data-k="intensity" min="0" max="4" step="0.1" value="${light.intensity}" title="Brightness">
+                        <button class="ghost" data-id="${light.id}" data-k="toggle"
+                            title="${light.enabled ? 'switch off (kept in the rig)' : 'switch back on'}">${light.enabled ? '💡' : '🚫'}</button>
+                        <button class="ghost" data-id="${light.id}" data-k="clone" title="duplicate this light with all its settings">⧉</button>
+                        <button class="ghost" data-id="${light.id}" data-k="remove" title="remove (or select it and press Delete)">✕</button>
+                    </div>
+                </div>${gradient}${bounceRow}`;
+            host.appendChild(card);
+        }
+        host.querySelectorAll('[data-k]').forEach(el => {
+            const id = parseInt(el.dataset.id, 10);
+            if (el.dataset.k === 'remove') {
+                el.addEventListener('click', () => { studio.removeLight(id); refreshLights(); });
+                return;
+            }
+            if (el.dataset.k === 'clone') {
+                el.addEventListener('click', () => { studio.cloneLight(id); refreshLights(); });
+                return;
+            }
+            if (el.dataset.k === 'select') {
+                el.addEventListener('click', () => { studio.selectLight(id); refreshLights(); });
+                return;
+            }
+            if (el.dataset.k === 'toggle') {
+                el.addEventListener('click', () => {
+                    const light = JSON.parse(studio.getLightsJson()).find(l => l.id === id);
+                    studio.updateLight(id, { enabled: !light.enabled });
+                    refreshLights();
+                });
+                return;
+            }
+            el.addEventListener(el.type === 'checkbox' ? 'change' : 'input', () => {
+                const lights = JSON.parse(studio.getLightsJson());
+                const light = lights.find(l => l.id === id);
+                const update = { color: light.color, farColor: light.farColor,
+                    intensity: light.intensity, decay: light.decay, gradientStart: light.gradientStart,
+                    bounceStrength: light.bounceStrength, size: light.size };
+                if (el.dataset.k === 'farTint') update.farColor = el.checked ? (light.farColor ?? '#c23f14') : null;
+                else if (el.dataset.k === 'bounceOn') update.bounceStrength = el.checked ? 0.5 : 0;
+                else update[el.dataset.k] = el.type === 'color' ? el.value : parseFloat(el.value);
+                studio.updateLight(id, update);
+                if (el.dataset.k === 'farTint' || el.dataset.k === 'bounceOn') refreshLights(); // sub-controls toggle
+            });
+        });
+    }
+    document.querySelectorAll('[data-orient]').forEach(button =>
+        button.addEventListener('click', () => {
+            const [axis, turns] = button.dataset.orient.split(',');
+            studio.reorient(axis, parseInt(turns, 10));
+        }));
+    $('orientReset').addEventListener('click', () => studio.resetOrientation());
+
+    document.querySelectorAll('[data-preset]').forEach(button =>
+        button.addEventListener('click', () => { studio.applyPreset(button.dataset.preset); refreshLights(); }));
+    $('addPoint').addEventListener('click', () => { studio.addLight('point', {}); refreshLights(); });
+    $('addDir').addEventListener('click', () => { studio.addLight('directional', {}); refreshLights(); });
+    $('ambient').addEventListener('input', () => studio.setEnvironmentLight({ intensity: parseFloat($('ambient').value) }));
+    $('floor').addEventListener('input', () => studio.setFloor({ color: $('floor').value }));
+    $('shadows').addEventListener('change', () => { studio.setShadows($('shadows').checked); syncShadowRow(); });
+
+    function syncShadowRow() {
+        $('shadowTintRow').style.display = $('shadows').checked ? '' : 'none';
+    }
+    const pushShadowTint = () => studio.setShadowTint({
+        color: $('shadowTint').value, strength: parseFloat($('shadowStrength').value) });
+    $('shadowTint').addEventListener('input', pushShadowTint);
+    $('shadowStrength').addEventListener('input', pushShadowTint);
+
+    // Lock highlights: only meaningful for the light-responsive PBR looks (matcap is already a
+    // fixed reference and toon has no specular) — the button hides itself elsewhere.
+    function syncLockButton() {
+        $('lockSpec').style.display = appearance.shader === 'pbr' ? '' : 'none';
+        const locked = studio.getSpecularLock();
+        $('lockSpec').textContent = locked ? '🔒 Highlights locked' : '🔒 Lock highlights';
+        $('lockSpec').className = locked ? 'active' : 'ghost';
+    }
+    $('lockSpec').addEventListener('click', () => {
+        studio.setSpecularLock(!studio.getSpecularLock());
+        syncLockButton();
+    });
+
+    // ---- Rigs (download/upload JSON — no server here) & capture
+    // Save via a real "Save As" dialog (File System Access API) where the browser supports it —
+    // the user picks the folder and name. Falls back to a plain download (Firefox/older Safari).
+    async function saveBlob(blob, suggestedName, description, mime, ext) {
+        if (window.showSaveFilePicker) {
+            try {
+                const handle = await window.showSaveFilePicker({
+                    suggestedName,
+                    types: [{ description, accept: { [mime]: [ext] } }]
+                });
+                const writable = await handle.createWritable();
+                await writable.write(blob);
+                await writable.close();
+                return;
+            } catch (error) {
+                if (error.name === 'AbortError') return; // user cancelled the dialog
+                // Any other failure (rare) falls through to the download path.
+            }
+        }
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = suggestedName;
+        a.click();
+        URL.revokeObjectURL(a.href);
+    }
+
+    $('saveRig').addEventListener('click', () => {
+        const blob = new Blob([studio.getSetup()], { type: 'application/json' });
+        saveBlob(blob, 'light-rig.json', 'Light rig', 'application/json', '.json');
+    });
+    $('loadRig').addEventListener('click', () => $('rigFile').click());
+    function syncEngineControls() {
+        $('ambient').value = studio.getAmbientIntensity();
+        $('floor').value = studio.getFloorColor();
+        $('shadows').checked = studio.getShadows();
+        const tint = JSON.parse(studio.getShadowTint());
+        $('shadowTint').value = tint.color;
+        $('shadowStrength').value = tint.strength;
+        syncShadowRow();
+        syncLockButton();
+        refreshLights();
+    }
+
+    $('rigFile').addEventListener('change', async () => {
+        const file = $('rigFile').files[0];
+        if (!file) return;
+        studio.applySetup(await file.text());
+        syncEngineControls();
+    });
+    $('shot').addEventListener('click', async () => {
+        const blob = await (await fetch(studio.screenshot())).blob();
+        saveBlob(blob, 'light-study.png', 'PNG image', 'image/png', '.png');
+    });
+
+    // Canvas-initiated changes (Delete key, Ctrl+Z undo) — resync every control that mirrors
+    // engine state, same set as after loading a rig.
+    studio.setChangeCallback(syncEngineControls);
+
+    applyLook('silvernmm');
+    refreshLights();
+    syncShadowRow();
+
+    // News badge: highlighted until the news page for this version has been opened once.
+    if (localStorage.getItem('pb-news-seen') !== '2026-07-10') $('newsLink').classList.add('unread');
+
+    // First visit: load the sample bust (CC0) so the page demonstrates itself — replaced the
+    // moment the visitor drops their own STL. Fetched after init so the UI paints first.
+    let userLoadedFile = false;
+    const markUserLoad = () => { userLoadedFile = true; };
+    $('file').addEventListener('change', markUserLoad);
+    drop.addEventListener('drop', markUserLoad);
+    (async () => {
+        try {
+            status.textContent = 'loading the sample bust…';
+            const response = await fetch('sample/caracalla.stl');
+            if (!response.ok) throw new Error(response.statusText);
+            const bytes = new Uint8Array(await response.arrayBuffer());
+            if (userLoadedFile) return; // the visitor beat us to it with their own model
+            const triangles = studio.loadStl(bytes);
+            refreshLights();
+            status.textContent = `sample: Bust of Emperor Caracalla (CC0) — ${triangles.toLocaleString()} triangles · drop your own STL to replace`;
+        } catch {
+            status.textContent = 'binary or ASCII STL · stays on your device';
+        }
+    })();
+</script>
+</body>
+</html>
