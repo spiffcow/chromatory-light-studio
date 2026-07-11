@@ -20,11 +20,21 @@
     <style>
         * { box-sizing: border-box; }
         body { background: #14171a; color: #ddd; font-family: system-ui, sans-serif; margin: 0; }
-        header { padding: 14px 18px 4px; }
+        header { max-width: 1060px; margin: 0 auto; padding: 14px 18px 4px; }
         h1 { font-size: 20px; margin: 0; }
         .muted { color: #98a4ae; } .small { font-size: 12px; }
         main { max-width: 1060px; margin: 0 auto; padding: 0 18px 40px; }
-        #canvas { width: 100%; aspect-ratio: 4/3; border-radius: 10px; background: #101315; touch-action: none; display: block; }
+        /* Height-capped so the render never outgrows the window on tall/wide screens. */
+        #canvas { width: min(100%, calc(76vh * 4 / 3)); aspect-ratio: 4/3; margin: 0 auto;
+                  border-radius: 10px; background: #101315; touch-action: none; display: block; }
+        /* Ultrawide: the studio spreads into two columns — the stage stays put on the left
+           while the control panel scrolls on the right. Narrow screens keep the single column. */
+        @media (min-width: 1500px) {
+            header, main { max-width: 1780px; }
+            main { display: grid; grid-template-columns: minmax(0, 1fr) 480px; gap: 26px; align-items: start; }
+            #stage { position: sticky; top: 12px; }
+            main > footer { grid-column: 1 / -1; }
+        }
         #drop { border: 2px dashed #2d6cdf; border-radius: 10px; padding: 36px 16px; text-align: center; margin: 12px 0; cursor: pointer; }
         #drop.hover { background: #1a2436; }
         h2 { font-size: 15px; margin: 16px 0 6px; }
@@ -56,6 +66,7 @@
         · <a href="news.html" id="newsLink">🔔 News</a> · <a href="terms.html">Terms</a></p>
 </header>
 <main>
+    <div id="stage">
     <div id="drop">
         <b>Drop an STL here</b> or <a href="#" id="pick">choose a file</a>
         <div class="muted small" id="loadstatus">binary or ASCII STL · stays on your device</div>
@@ -76,7 +87,9 @@
         <button class="ghost" data-orient="z,-1" title="Roll right">⟳</button>
         <button class="ghost" id="orientReset" title="Back to how it loaded">Reset</button>
     </div>
+    </div><!-- /stage -->
 
+    <div id="panel">
     <h2>Look</h2>
     <div class="muted small">Responds to your lights:</div>
     <div class="row" id="looks-live"></div>
@@ -125,6 +138,7 @@
         <input type="file" id="rigFile" accept=".json" style="display:none" />
         <button class="primary" id="shot">📸 Save render (PNG)</button>
     </div>
+    </div><!-- /panel -->
 
     <footer class="muted small">
         Part of <b>Paint Buddy</b>, the local-first assistant for miniature painters.
