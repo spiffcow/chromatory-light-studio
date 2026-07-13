@@ -63,6 +63,7 @@
     <p class="muted small">Plan light placement for NMM and OSL: load the STL you print from, place
         lights, pick a look, and copy the highlights. Runs entirely in your browser — the model is
         never uploaded, so any size your machine can handle is fine.
+        · <a href="assembly/" id="assemblyLink" style="display:none">🧩 Assembly workbench</a>
         · <a href="news.html" id="newsLink">🔔 News</a> · <a href="terms.html">Terms</a></p>
 </header>
 <main>
@@ -124,12 +125,32 @@
         <label><input type="checkbox" id="shadows" checked /> Shadows</label>
         <span class="muted small">the model blocks light — turn off on weak GPUs</span>
     </div>
+    <div class="row">
+        <label><input type="checkbox" id="lightDots" checked /> Light source dots</label>
+        <span class="muted small">the glowing orbs where your lights sit — off shows just their light (saved renders follow this)</span>
+    </div>
     <div class="row" id="shadowTintRow">
         <label>Shadow colour <input type="color" id="shadowTint" value="#000000" /></label>
         <label>Strength <input type="range" id="shadowStrength" min="0" max="1" step="0.05" value="1" /></label>
         <span class="muted small">painters shade toward a colour, not black — try a cool blue-violet</span>
     </div>
     <div id="lights"></div>
+
+    <div id="sceneSection" style="display:none">
+        <h2>Scene</h2>
+        <div class="muted small">Add more STLs to light a composed scene (a base, scenery, a second
+            mini). Click one to select it, then drag its gizmo to move or turn it. Scene models are
+            session-only — save a render to keep the composition.</div>
+        <div class="row">
+            <button id="addProp">📂 Add STL</button>
+            <input type="file" id="propFile" accept=".stl" multiple style="display:none" />
+            <span id="propModeButtons" style="display:none">
+                <button id="propMove" class="active" title="Drag to move the selected model">↔ Move</button>
+                <button id="propRotate" class="ghost" title="Drag to turn the selected model">⟳ Rotate</button>
+            </span>
+        </div>
+        <div class="row" id="props"></div>
+    </div>
 
     <h2>Rigs &amp; capture</h2>
     <div class="row">
@@ -151,10 +172,18 @@
 <script type="module">
     import * as studio from './js/lightstudio.js';
 
+    // Release feature flags for the STANDALONE build — edited per release, applied at load.
+    // regions: the in-app region painting / fill / glow-region tools stay app-only for now.
+    // assembly: links the Assembly workbench (published under /assembly/ by the deploy script).
+    // multiStl: the Scene section — add extra STLs as movable props to light a composed scene.
+    const FEATURES = { regions: false, assembly: true, multiStl: true };
+
     const $ = id => document.getElementById(id);
     const status = $('loadstatus');
 
     studio.init($('canvas'));
+    $('assemblyLink').style.display = FEATURES.assembly ? '' : 'none';
+    $('sceneSection').style.display = FEATURES.multiStl ? '' : 'none';
 
     // ---- STL loading (file picker + drag & drop, no size limit — it never leaves the client)
     async function loadFile(file) {
@@ -222,9 +251,25 @@
         appearance.metalness = parseFloat($('metal').value);
         appearance.roughness = parseFloat($('rough').value);
         appearance.toonBands = parseInt($('bands').value, 10);
+        appearance.lookKey = currentLook; // rides into saved rigs so a load re-highlights the look
         studio.setAppearance(appearance);
     }
     for (const id of ['color', 'metal', 'rough', 'bands']) $(id).addEventListener('input', pushAppearance);
+
+    // After a rig load (or Ctrl+Z) the ENGINE holds the restored appearance — mirror it back into
+    // the panel instead of letting stale inputs stomp it on the next touch.
+    function syncAppearanceControls() {
+        const a = JSON.parse(studio.getAppearanceJson());
+        Object.assign(appearance, a);
+        if (a.lookKey && studio.LOOKS[a.lookKey]) currentLook = a.lookKey;
+        if (a.color) $('color').value = a.color;
+        $('metal').value = a.metalness ?? 1;
+        $('rough').value = a.roughness ?? 0.3;
+        $('bands').value = a.toonBands ?? 4;
+        $('bandsRow').style.display = a.shader === 'toon' ? '' : 'none';
+        $('pbrRow').style.display = a.shader === 'pbr' ? '' : 'none';
+        renderLookButtons();
+    }
 
     // ---- Lights
     function refreshLights() {
@@ -320,6 +365,58 @@
     $('ambient').addEventListener('input', () => studio.setEnvironmentLight({ intensity: parseFloat($('ambient').value) }));
     $('floor').addEventListener('input', () => studio.setFloor({ color: $('floor').value }));
     $('shadows').addEventListener('change', () => { studio.setShadows($('shadows').checked); syncShadowRow(); });
+    $('lightDots').addEventListener('change', () => {
+        studio.setLightHandlesVisible($('lightDots').checked);
+        refreshLights(); // hiding also deselects; keep the ▶ markers honest
+    });
+
+    // ---- Scene props (multiple STLs, session-only)
+    function refreshProps() {
+        if (!FEATURES.multiStl) return;
+        const list = JSON.parse(studio.listProps());
+        const host = $('props');
+        host.innerHTML = '';
+        for (const prop of list) {
+            const chip = document.createElement('span');
+            chip.className = 'row';
+            chip.style.cssText = 'gap:0;flex-wrap:nowrap';
+            const pick = document.createElement('button');
+            pick.className = prop.selected ? 'active' : 'ghost';
+            pick.textContent = prop.name;
+            pick.title = 'Select to move / turn';
+            pick.addEventListener('click', () => { studio.selectPropById(prop.id); refreshProps(); });
+            const remove = document.createElement('button');
+            remove.className = 'ghost';
+            remove.textContent = '✕';
+            remove.title = 'Remove from the scene';
+            remove.addEventListener('click', () => { studio.deleteProp(prop.id); refreshProps(); });
+            chip.append(pick, remove);
+            host.appendChild(chip);
+        }
+        $('propModeButtons').style.display = list.some(p => p.selected) ? '' : 'none';
+    }
+    if (FEATURES.multiStl) {
+        $('addProp').addEventListener('click', () => $('propFile').click());
+        $('propFile').addEventListener('change', async () => {
+            for (const file of $('propFile').files) {
+                try {
+                    const bytes = new Uint8Array(await file.arrayBuffer());
+                    studio.addStl(bytes, file.name.replace(/\.stl$/i, ''), null, null);
+                } catch (error) {
+                    status.textContent = `couldn't read ${file.name}: ${error.message}`;
+                }
+            }
+            $('propFile').value = '';
+            refreshProps();
+        });
+        const setPropMode = mode => {
+            studio.setPropMode(mode);
+            $('propMove').className = mode === 'translate' ? 'active' : 'ghost';
+            $('propRotate').className = mode === 'rotate' ? 'active' : 'ghost';
+        };
+        $('propMove').addEventListener('click', () => setPropMode('translate'));
+        $('propRotate').addEventListener('click', () => setPropMode('rotate'));
+    }
 
     function syncShadowRow() {
         $('shadowTintRow').style.display = $('shadows').checked ? '' : 'none';
@@ -377,12 +474,15 @@
         $('ambient').value = studio.getAmbientIntensity();
         $('floor').value = studio.getFloorColor();
         $('shadows').checked = studio.getShadows();
+        $('lightDots').checked = studio.getLightHandlesVisible();
         const tint = JSON.parse(studio.getShadowTint());
         $('shadowTint').value = tint.color;
         $('shadowStrength').value = tint.strength;
+        syncAppearanceControls(); // rigs restore the LOOK too — the panel must follow
         syncShadowRow();
         syncLockButton();
         refreshLights();
+        refreshProps();
     }
 
     $('rigFile').addEventListener('change', async () => {
@@ -402,10 +502,11 @@
 
     applyLook('silvernmm');
     refreshLights();
+    refreshProps();
     syncShadowRow();
 
     // News badge: highlighted until the news page for this version has been opened once.
-    if (localStorage.getItem('pb-news-seen') !== '2026-07-10') $('newsLink').classList.add('unread');
+    if (localStorage.getItem('pb-news-seen') !== '2026-07-13') $('newsLink').classList.add('unread');
 
     // First visit: load the sample bust (CC0) so the page demonstrates itself — replaced the
     // moment the visitor drops their own STL. Fetched after init so the UI paints first.

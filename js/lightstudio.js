@@ -11,6 +11,13 @@ let renderer, scene, camera, controls, canvasEl, hemi, ground;
 let axisControl = null;      // translate gizmo (X/Y/Z arrows) for the selected light
 let selectedLightId = null;
 let mesh = null;
+let modelScale = 1;          // units/mm applied to the primary model; reused so imported STLs keep relative size
+
+// Imported STLs (scene props) — extra models brought in to light a composed scene.
+let propControl = null;      // move/rotate gizmo for the selected prop
+const props = new Map();     // id → { mesh, name }
+let selectedPropId = null;
+let propSeq = 0;
 
 // Occlusion: whether the model blocks light. On by default; a toggle exists because cube
 // shadow maps over millions of triangles can strain weak GPUs (the standalone runs anywhere).
@@ -145,7 +152,21 @@ export function undo() {
     const top = undoStack.pop();
     if (!top) return false;
     restoringUndo = true;
-    try { applySetup(top.json); } finally { restoringUndo = false; }
+    try {
+        if (top.paintDiff) {
+            for (const [i, prev] of top.paintDiff) regionIndex[i] = prev;
+            repaintColors();
+            refreshRegionLights();
+            regionsDirty = true; // undone paint still differs from what's saved
+            if (isolated >= 0 && highlightAttr) {
+                for (const [i] of top.paintDiff) highlightAttr.setX(i, regionIndex[i] === isolated ? 1 : 0);
+                highlightAttr.needsUpdate = true;
+            }
+            notifyChanged(); // the panel re-reads the dirty state
+        } else {
+            applySetup(top.json);
+        }
+    } finally { restoringUndo = false; }
     return true;
 }
 
@@ -160,10 +181,17 @@ function onKeyDown(event) {
         event.preventDefault();
         if (undo()) notifyChanged();
     }
-    else if ((event.key === 'Delete' || event.key === 'Backspace') && selectedLightId !== null) {
-        event.preventDefault();
-        removeLight(selectedLightId);
-        notifyChanged();
+    else if (event.key === 'Delete' || event.key === 'Backspace') {
+        if (selectedPropId !== null) {
+            event.preventDefault();
+            deleteProp(selectedPropId);
+            notifyChanged();
+        }
+        else if (selectedLightId !== null) {
+            event.preventDefault();
+            removeLight(selectedLightId);
+            notifyChanged();
+        }
     }
 }
 
@@ -197,6 +225,14 @@ export const LOOKS = {
 export function getLooksJson() {
     return JSON.stringify(LOOKS);
 }
+
+// The model's two materials are long-lived and SWAPPED, never rebuilt per paint-mode toggle:
+// disposing a material releases its compiled program, so rebuild-per-toggle meant recompiling the
+// physical mega-shader (a visible stall on big prints), churned GPU memory, and re-ran the fragile
+// fresh-program-first-draw path. lookMaterial rebuilds only when the look itself changes (or the
+// region patch must attach); paintMaterial is created once per model.
+let lookMaterial = null;
+let paintMaterial = null;
 
 // Current appearance state (kept so shader switches preserve color etc., and for getSetup()).
 const appearance = {
@@ -234,7 +270,12 @@ export function init(canvas) {
         console.warn('lightstudio: WebGL context restored — rebuilding environment');
         buildEnvironment();
         matcapCache.clear();
-        if (mesh) { mesh.material.dispose(); mesh.material = buildMaterial(); }
+        paintMaterial?.dispose();
+        paintMaterial = null;
+        if (mesh) {
+            rebuildLookMaterial();
+            if (paintMode) mesh.material = ensurePaintMaterial();
+        }
         if (ground) ground.material.needsUpdate = true;
         requestShadowUpdate();
     });
@@ -283,6 +324,16 @@ export function init(canvas) {
     });
     scene.add(axisControl);
 
+    // A second gizmo for imported STLs — move (translate) or turn (rotate) the selected prop.
+    propControl = new TransformControls(camera, canvas);
+    propControl.setSize(0.9);
+    propControl.addEventListener('dragging-changed', event => {
+        controls.enabled = !event.value;
+        if (!event.value) notifyChanged(); // on release, the panel debounce-saves the scene
+    });
+    propControl.addEventListener('objectChange', () => requestShadowUpdate());
+    scene.add(propControl);
+
     // A soft sky/ground fill so unlit faces read as shape, never pure black. Hemisphere rather
     // than flat ambient: the subtle top-vs-bottom difference keeps form readable on the dark
     // NMM body without competing with the user's placed lights.
@@ -309,8 +360,15 @@ export function init(canvas) {
     canvas.addEventListener('pointerdown', onPointerDown);
     canvas.addEventListener('pointermove', onPointerMove);
     canvas.addEventListener('pointerup', onPointerUp);
+    canvas.addEventListener('pointerleave', () => {
+        if (brushCursor) brushCursor.visible = false;
+        hideFillPreview();
+    });
+    // Right-drag erases in paint mode — the browser menu would swallow the gesture.
+    canvas.addEventListener('contextmenu', event => event.preventDefault());
 
     renderer.setAnimationLoop(() => {
+        processPendingPaint();
         controls.update();
         syncStudioUniforms();
         renderer.render(scene, camera);
@@ -320,6 +378,7 @@ export function init(canvas) {
 /// (Re)builds the PMREM studio environment — also called after a WebGL context restore,
 /// because prefiltered environments live in render targets that do not survive the loss.
 function buildEnvironment() {
+    scene.environment?.dispose(); // free the previous prefiltered env before replacing it
     const pmrem = new THREE.PMREMGenerator(renderer);
     scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
     pmrem.dispose();
@@ -329,11 +388,29 @@ export function dispose() {
     renderer?.setAnimationLoop(null);
     window.removeEventListener('resize', resize);
     window.removeEventListener('keydown', onKeyDown);
-    renderer?.dispose();
+
+    // Free every GPU resource the scene holds (renderer.dispose alone does NOT) — the model geometry
+    // can be hundreds of MB, so leaking it across open/close cycles is how the studio runs out of memory.
+    if (mesh) { mesh.geometry.dispose(); mesh = null; }
+    lookMaterial?.dispose();
+    lookMaterial = null;
+    paintMaterial?.dispose();
+    paintMaterial = null;
+    resetRegions(); // disposes the region-highlight overlay
+    if (brushCursor) { brushCursor.geometry.dispose(); brushCursor.material.dispose(); brushCursor = null; }
+    for (const entry of lights.values()) {
+        unmountLights(entry); // disposes each light's shadow map
+        entry.gizmo.geometry.dispose();
+        entry.gizmo.material.dispose();
+    }
     lights.clear();
+    for (const entry of props.values()) { entry.mesh.geometry.dispose(); entry.mesh.material.dispose(); }
+    props.clear();
+    scene?.environment?.dispose();
+    renderer?.dispose();
+    selectedPropId = null;
     undoStack.length = 0;
     changeCallback = null;
-    mesh = null;
 }
 
 function resize() {
@@ -356,6 +433,11 @@ function resize() {
 
 export function loadStl(bytes) {
     if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); }
+    resetRegions(); // a new geometry invalidates any painted mask (before the material rebuild reads attr state)
+    lookMaterial?.dispose();
+    lookMaterial = null;
+    paintMaterial?.dispose();
+    paintMaterial = null;
 
     const geometry = new STLLoader().parse(bytes.buffer ?? bytes);
     geometry.computeVertexNormals();
@@ -368,13 +450,15 @@ export function loadStl(bytes) {
     const size = new THREE.Vector3();
     geometry.boundingBox.getSize(size);
     const scale = 80 / Math.max(size.x, size.y, size.z);
+    modelScale = scale; // imported props scale by the same factor so their size stays relative
     geometry.scale(scale, scale, scale);
     geometry.computeBoundingBox();
     geometry.translate(0, -geometry.boundingBox.min.y, 0);
     geometry.computeBoundingSphere();
     modelRadius = geometry.boundingSphere.radius;
 
-    mesh = new THREE.Mesh(geometry, buildMaterial());
+    paintMode = false; // a fresh model starts on the lit look
+    mesh = new THREE.Mesh(geometry, rebuildLookMaterial());
     mesh.name = 'model';
     mesh.castShadow = true;
     mesh.receiveShadow = true;
@@ -432,6 +516,7 @@ function applyOrientationDelta(delta) {
         -(geometry.boundingBox.min.z + geometry.boundingBox.max.z) / 2);
     geometry.computeBoundingSphere(); // normals rotate with applyQuaternion; no recompute needed
     modelRadius = geometry.boundingSphere.radius;
+    paintGrid = null; // vertex positions moved — the brush grid must be rebuilt
 
     orientation.premultiply(delta);
     requestShadowUpdate();
@@ -548,12 +633,17 @@ function normalize(v) {
     return [v[0] / l, v[1] / l, v[2] / l];
 }
 
+const toonCache = new Map();
 function toonGradient(bands) {
+    // Cached like the matcaps: rebuilt materials would otherwise leak a DataTexture each time (a
+    // disposed material does not dispose its gradientMap), and there are only a few band counts.
+    if (toonCache.has(bands)) return toonCache.get(bands);
     const data = new Uint8Array(bands);
     for (let i = 0; i < bands; i++) data[i] = Math.round((i / (bands - 1)) * 255);
     const texture = new THREE.DataTexture(data, bands, 1, THREE.RedFormat);
     texture.needsUpdate = true;
     texture.minFilter = texture.magFilter = THREE.NearestFilter;
+    toonCache.set(bands, texture);
     return texture;
 }
 
@@ -648,7 +738,27 @@ export function getShadowTint() {
     return JSON.stringify({ color: shadowTintColor, strength: shadowStrength });
 }
 
-function buildMaterial() {
+/// (Re)builds the cached lit-look material from the current appearance; swaps it in when it is the
+/// one showing. The old one is disposed here — the ONLY place the look material is ever released.
+function rebuildLookMaterial() {
+    lookMaterial?.dispose();
+    lookMaterial = buildMaterial();
+    lookMaterial.userData.regionPatch = !!regionSurfAttr;
+    if (mesh && !paintMode) mesh.material = lookMaterial;
+    return lookMaterial;
+}
+
+/// The flat-lit vertex-colour paint-mode material — created once per model, then reused across
+/// every paint-mode toggle (rebuilding meant recompiling its program every single toggle).
+function ensurePaintMaterial() {
+    if (!paintMaterial) {
+        paintMaterial = applyRegionSurfacePatch(
+            new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.75, metalness: 0.0 }), false);
+    }
+    return paintMaterial;
+}
+
+function buildMaterial(withRegions = true) {
     const color = new THREE.Color(appearance.color);
     switch (appearance.shader) {
         case 'matcap': {
@@ -673,8 +783,8 @@ function buildMaterial() {
                 specular: new THREE.Color(appearance.specular ?? '#ffffff'),
                 shininess: appearance.shininess ?? 90
             }));
-        default:
-            return applyStudioShaderPatches(new THREE.MeshPhysicalMaterial({
+        default: {
+            const material = applyStudioShaderPatches(new THREE.MeshPhysicalMaterial({
                 color,
                 metalness: appearance.metalness,
                 roughness: appearance.roughness,
@@ -682,6 +792,11 @@ function buildMaterial() {
                 // Scaled by the ambient "room light" level — metals show the room, not the fill.
                 envMapIntensity: (appearance.envIntensity ?? 0.4) * ambientEnvScale()
             }));
+            // Painted regions with their own material (metal armour on a matte look…) override the
+            // surface per vertex. Model only — props have no regions — and only once the region
+            // buffers exist, so an unpainted model compiles no extra attributes.
+            return withRegions && regionSurfAttr ? applyRegionSurfacePatch(material, true) : material;
+        }
     }
 }
 
@@ -724,9 +839,13 @@ export function setEnvironmentLight(options) {
 export function setAppearance(update) {
     captureUndo('appearance', true);
     Object.assign(appearance, update);
-    if (mesh) {
-        mesh.material.dispose();
-        mesh.material = buildMaterial();
+    // Rebuild the cached look (a real look change is the one legitimate rebuild); in paint mode the
+    // flat region material keeps showing and the new look appears on exit via the cache.
+    if (mesh) rebuildLookMaterial();
+    // Imported props follow the look too (without the region patch — props aren't paintable).
+    for (const entry of props.values()) {
+        entry.mesh.material.dispose();
+        entry.mesh.material = buildMaterial(false);
     }
 }
 
@@ -872,6 +991,10 @@ function unmountLights(entry) {
     for (const light of entry.lights ?? []) {
         scene.remove(light);
         if (light.target) scene.remove(light.target);
+        // A shadow-casting light owns a render-target shadow map (several MB). Removing the light does
+        // NOT free it, so cycling light presets would pile them up until the GPU runs out of memory.
+        light.shadow?.map?.dispose();
+        light.shadow?.dispose?.();
     }
     entry.lights = [];
 }
@@ -886,6 +1009,7 @@ export function addLight(type, options) {
     const gizmo = new THREE.Mesh(new THREE.SphereGeometry(3.2, 16, 16), gizmoMaterial);
     clampHandle(gizmo.position.set(options?.x ?? 40, options?.y ?? 90, options?.z ?? 60));
     gizmo.userData.lightId = id;
+    gizmo.visible = lightHandlesVisible; // the dots can be hidden while the lights stay on
     scene.add(gizmo);
 
     const entry = {
@@ -897,20 +1021,101 @@ export function addLight(type, options) {
         gradientStart: clampGradientStart(options?.gradientStart),
         bounceStrength: Math.min(1, Math.max(0, options?.bounceStrength ?? 0)),
         size: type === 'point' ? Math.min(24, Math.max(0, options?.size ?? 0)) : 0,
+        // A glow-region light is anchored to a painted region: its position/colour derive from the
+        // region (recomputed when painting changes) and the region's surface renders emissive.
+        regionSource: type === 'point' ? (options?.regionSource ?? null) : null,
         enabled: options?.enabled !== false // switched off but kept: the dimmed handle stays put
     };
     entry.gizmo.scale.setScalar(1 + entry.size / 8); // the handle hints at the source size
-    applyGizmoEnabledLook(entry);
+    if (entry.regionSource !== null && options?.x === undefined) anchorRegionLight(entry);
     if (entry.enabled) mountLights(entry);
     else entry.lights = [];
+    applyLightOrbLook(entry);
     lights.set(id, entry);
+    syncGlowingSlots();
     return id;
 }
 
-/// A switched-off light keeps its handle as a dim ghost so it can still be selected and moved.
-function applyGizmoEnabledLook(entry) {
-    entry.gizmo.material.transparent = !entry.enabled;
-    entry.gizmo.material.opacity = entry.enabled ? 1 : 0.3;
+// ----- Glow-region lights ---------------------------------------------------------------------
+// The light source IS a painted region (a glowing blade, lava, runes): a point light sits just off
+// the region's surface (area-weighted centroid pushed out along the average normal) in the region's
+// colour, and the region itself renders emissive so it reads as the emitter.
+
+/// Recomputes a glow light's position + colour from its region's current painting.
+function anchorRegionLight(entry) {
+    const k = entry.regionSource;
+    if (k === null || !regionIndex || !mesh) return false;
+    const pos = mesh.geometry.attributes.position;
+
+    let cx = 0, cy = 0, cz = 0, nx = 0, ny = 0, nz = 0, count = 0;
+    for (let t = 0; t < regionIndex.length / 3; t++) {
+        if (regionIndex[t * 3] !== k) continue; // soup: face label = its first vertex's label
+        const i = t * 3;
+        cx += (pos.getX(i) + pos.getX(i + 1) + pos.getX(i + 2)) / 3;
+        cy += (pos.getY(i) + pos.getY(i + 1) + pos.getY(i + 2)) / 3;
+        cz += (pos.getZ(i) + pos.getZ(i + 1) + pos.getZ(i + 2)) / 3;
+        const ux = pos.getX(i + 1) - pos.getX(i), uy = pos.getY(i + 1) - pos.getY(i), uz = pos.getZ(i + 1) - pos.getZ(i);
+        const vx = pos.getX(i + 2) - pos.getX(i), vy = pos.getY(i + 2) - pos.getY(i), vz = pos.getZ(i + 2) - pos.getZ(i);
+        nx += uy * vz - uz * vy; ny += uz * vx - ux * vz; nz += ux * vy - uy * vx;
+        count++;
+    }
+    if (count === 0) return false; // region erased — the light stays where it was
+
+    cx /= count; cy /= count; cz /= count;
+    const nLen = Math.hypot(nx, ny, nz) || 1;
+    // Push off the surface so the light isn't born inside the mesh (self-shadowed to nothing).
+    const off = modelRadius * 0.12;
+    entry.gizmo.position.set(cx + (nx / nLen) * off, cy + (ny / nLen) * off, cz + (nz / nLen) * off);
+    clampHandle(entry.gizmo.position);
+
+    const slot = regionPalette[k - 1];
+    if (slot) entry.color = slot.color;
+    return true;
+}
+
+/// Re-anchors every glow light and refreshes the emissive flags — called whenever painting,
+/// palette colours, or the mask itself change shape.
+function refreshRegionLights() {
+    let anyLight = false;
+    for (const entry of lights.values()) {
+        if (entry.regionSource === null) continue;
+        anyLight = true;
+        anchorRegionLight(entry);
+        applyLightOrbLook(entry);
+        unmountLights(entry);
+        if (entry.enabled) mountLights(entry);
+    }
+    if (anyLight) requestShadowUpdate();
+    syncGlowingSlots();
+}
+
+/// Which region slots currently power an ENABLED glow light — those render emissive.
+function syncGlowingSlots() {
+    const glowing = new Set();
+    for (const entry of lights.values()) {
+        if (entry.regionSource !== null && entry.enabled) glowing.add(entry.regionSource);
+    }
+    const changed = glowing.size !== glowingSlots.size || [...glowing].some(k => !glowingSlots.has(k));
+    glowingSlots = glowing;
+    if (changed && regionIndex) repaintColors(); // rebake the emissive flags into aRegionSurf
+}
+
+/// The handle sphere IS the visible light source: an orb at the light's colour driven past 1.0
+/// by its intensity, so ACES renders it as a hot glowing emitter — not a flat UI marker. A
+/// switched-off light keeps a dim ghost so it can still be selected and moved.
+function applyLightOrbLook(entry) {
+    const material = entry.gizmo.material;
+    if (entry.enabled) {
+        material.color.set(entry.color).multiplyScalar(1 + entry.uiIntensity * 1.5);
+        material.toneMapped = true; // the tone mapper rolls the hot core off like a real emitter
+        material.transparent = false;
+        material.opacity = 1;
+    } else {
+        material.color.set(entry.color);
+        material.toneMapped = false;
+        material.transparent = true;
+        material.opacity = 0.3;
+    }
 }
 
 export function updateLight(id, update) {
@@ -918,10 +1123,7 @@ export function updateLight(id, update) {
     if (!entry) return;
     captureUndo('update:' + id, true);
 
-    if (update.color !== undefined) {
-        entry.color = update.color;
-        entry.gizmo.material.color.set(update.color);
-    }
+    if (update.color !== undefined) entry.color = update.color;
     if (update.farColor !== undefined) entry.farColor = entry.type === 'point' ? update.farColor : null;
     if (update.intensity !== undefined) entry.uiIntensity = update.intensity;
     if (update.decay !== undefined) entry.decay = clampDecay(update.decay);
@@ -932,11 +1134,9 @@ export function updateLight(id, update) {
         entry.size = entry.type === 'point' ? Math.min(24, Math.max(0, update.size)) : 0;
         entry.gizmo.scale.setScalar(1 + entry.size / 8);
     }
-    if (update.enabled !== undefined) {
-        entry.enabled = !!update.enabled;
-        applyGizmoEnabledLook(entry);
-    }
+    if (update.enabled !== undefined) { entry.enabled = !!update.enabled; syncGlowingSlots(); }
     if (update.x !== undefined) clampHandle(entry.gizmo.position.set(update.x, update.y, update.z));
+    applyLightOrbLook(entry); // colour/intensity/enabled all feed the orb's glow
 
     // Rebuild rather than mutate: color/decay/gradient changes can change the NUMBER of
     // underlying lights, and ≤4 rig lights make this trivially cheap.
@@ -952,7 +1152,10 @@ export function removeLight(id) {
     if (selectedLightId === id) selectLight(null);
     unmountLights(entry);
     scene.remove(entry.gizmo);
+    entry.gizmo.geometry.dispose();
+    entry.gizmo.material.dispose();
     lights.delete(id);
+    syncGlowingSlots(); // a removed glow light stops its region's emissive
     requestShadowUpdate();
 }
 
@@ -1021,6 +1224,7 @@ export function getLightsJson() {
             gradientStart: entry.gradientStart,
             bounceStrength: entry.bounceStrength,
             size: entry.size,
+            regionSource: entry.regionSource,
             enabled: entry.enabled,
             selected: id === selectedLightId
         });
@@ -1041,18 +1245,54 @@ function setPointer(event) {
 }
 
 function onPointerDown(event) {
-    if (axisControl?.dragging) return; // an arrow grab is in progress — it owns this gesture
+    if (axisControl?.dragging || propControl?.dragging) return; // a gizmo grab owns this gesture
 
     setPointer(event);
     raycaster.setFromCamera(pointer, camera);
-    const gizmos = [...lights.values()].map(entry => entry.gizmo);
-    const hit = raycaster.intersectObjects(gizmos)[0];
-    if (!hit) {
-        // Empty click puts the arrows away (axis grabs never reach here — see above).
-        if (selectedLightId !== null) { selectLight(null); notifyChanged(); }
+
+    // Region painting owns the gesture when it lands on the model; empty space still orbits.
+    // Left paints the selected region; RIGHT erases (region 0) without reselecting.
+    if (paintMode && mesh && (event.button === 0 || event.button === 2)) {
+        const paintHit = raycaster.intersectObject(mesh)[0];
+        if (paintHit) {
+            strokeDiff = new Map(); // record pre-stroke region indices so the stroke can be undone
+            strokeRegion = event.button === 2 ? 0 : brush.region;
+            if (brush.mode === 'fill') {
+                // One click = one fill = one undo step; no drag gesture to hold.
+                ensureRegionBuffers();
+                fillFromFace(paintHit.faceIndex ?? -1);
+                pushPaintUndo(strokeDiff);
+                strokeDiff = null;
+                notifyChanged();
+                return;
+            }
+            painting = true;
+            controls.enabled = false;
+            canvasEl.setPointerCapture(event.pointerId);
+            paintAt(paintHit.point);
+            updateBrushCursor(paintHit);
+        }
         return;
     }
 
+    // Hidden handles are not clickable — invisible grab targets would be baffling.
+    const gizmos = lightHandlesVisible ? [...lights.values()].map(entry => entry.gizmo) : [];
+    const hit = raycaster.intersectObjects(gizmos)[0];
+    if (!hit) {
+        // Not a light handle — try an imported prop, else clear the selection.
+        const propMeshes = [...props.values()].map(e => e.mesh);
+        const propHit = propMeshes.length ? raycaster.intersectObjects(propMeshes)[0] : null;
+        if (propHit) {
+            selectProp(propHit.object.userData.propId);
+            notifyChanged();
+            return;
+        }
+        if (selectedLightId !== null) { selectLight(null); notifyChanged(); }
+        if (selectedPropId !== null) { deselectProp(); notifyChanged(); }
+        return;
+    }
+
+    if (selectedPropId !== null) deselectProp(); // switching from a prop to a light
     if (selectedLightId !== hit.object.userData.lightId) {
         selectLight(hit.object.userData.lightId);
         notifyChanged(); // the panel highlights the selected light's card
@@ -1065,6 +1305,20 @@ function onPointerDown(event) {
     canvasEl.setPointerCapture(event.pointerId);
 }
 
+// The glowing balls marking light positions. Hiding them (lights unchanged!) gives a clean view
+// for reading the render; captures exclude them regardless.
+let lightHandlesVisible = true;
+
+export function setLightHandlesVisible(on) {
+    lightHandlesVisible = !!on;
+    for (const entry of lights.values()) entry.gizmo.visible = lightHandlesVisible;
+    if (!lightHandlesVisible) selectLight(null); // arrows belong to the handles; hide those too
+}
+
+export function getLightHandlesVisible() {
+    return lightHandlesVisible;
+}
+
 /// Shows the X/Y/Z arrows on one light's handle (null hides them).
 export function selectLight(id) {
     selectedLightId = id;
@@ -1074,6 +1328,13 @@ export function selectLight(id) {
 }
 
 function onPointerMove(event) {
+    // Paint-mode moves are COALESCED to one raycast per rendered frame (processPendingPaint):
+    // gaming mice fire 250+ moves/sec, and every one used to raycast a multi-million-triangle
+    // mesh — several full-mesh raycasts per frame was most of paint mode's sluggishness.
+    if (painting || (paintMode && mesh && dragging === null)) {
+        pendingPaintMove = event;
+        return;
+    }
     if (dragging === null) return;
     setPointer(event);
     raycaster.setFromCamera(pointer, camera);
@@ -1086,9 +1347,888 @@ function onPointerMove(event) {
     }
 }
 
+/// One raycast per frame for the paint brush (stamp while stroking, ring preview otherwise; in
+/// fill mode the hover shows a dashed boundary of what a click would fill).
+let lastPaintHover = null;
+function processPendingPaint() {
+    if (!pendingPaintMove) return;
+    const event = pendingPaintMove;
+    pendingPaintMove = null;
+    if (!mesh || !paintMode) return;
+    lastPaintHover = event; // re-injected when the fill angle changes, so the preview tracks the slider
+    setPointer(event);
+    raycaster.setFromCamera(pointer, camera);
+    const hit = raycaster.intersectObject(mesh)[0];
+    if (brush.mode === 'fill') {
+        if (!hit || hit.faceIndex === undefined) { hideFillPreview(); return; }
+        const now = performance.now();
+        const changed = hit.faceIndex !== fillPreview.face || brush.fillAngle !== fillPreview.angle;
+        if (changed && now - fillPreview.time > 90) { // BFS per hover is real work on big fills
+            updateFillPreview(hit.faceIndex);
+            fillPreview.face = hit.faceIndex;
+            fillPreview.angle = brush.fillAngle;
+            fillPreview.time = now;
+        }
+        return;
+    }
+    if (painting && hit) paintAt(hit.point);
+    updateBrushCursor(hit);
+}
+
 function onPointerUp() {
+    if (painting) {
+        painting = false;
+        controls.enabled = true;
+        pushPaintUndo(strokeDiff); // one undo step per stroke
+        strokeDiff = null;
+        notifyChanged(); // tells the panel there are unsaved region changes
+        return;
+    }
     dragging = null;
     controls.enabled = true;
+}
+
+/// A paint stroke/clear is undone by restoring the recorded vertices, not by a full setup snapshot.
+/// Paint diffs hold a Map entry per touched vertex — on a multi-million-vertex print a broad stroke
+/// is tens of MB, so they get their own tight cap (and whole-model diffs aren't kept at all: a
+/// 9M-entry Map is hundreds of MB of heap, a real out-of-memory source).
+const PAINT_UNDO_LIMIT = 6;
+const PAINT_UNDO_MAX_ENTRIES = 1_000_000;
+function pushPaintUndo(diff) {
+    if (!diff || diff.size === 0) return;
+    if (diff.size > PAINT_UNDO_MAX_ENTRIES) return;
+    if (undoStack.filter(u => u.paintDiff).length >= PAINT_UNDO_LIMIT) {
+        const oldest = undoStack.findIndex(u => u.paintDiff);
+        if (oldest !== -1) undoStack.splice(oldest, 1);
+    }
+    undoStack.push({ tag: 'paint', paintDiff: diff });
+    if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Region painting — mark areas on the STL surface (per-vertex) to highlight by area.
+//
+// The mask is a per-vertex region index (0 = unpainted); painting is a spherical brush that sets
+// every vertex within a world-space radius of the hit point. In paint mode the model switches to
+// a flat, unlit vertex-colour material so regions read clearly; the lit look is left untouched and
+// rebuilt on exit. The mask + palette persist as one JSON blob per model.
+// ---------------------------------------------------------------------------------------------
+
+let paintMode = false;
+let painting = false;
+let strokeDiff = null;         // during a stroke: vertexIndex → previous region index, for undo
+let strokeRegion = 1;          // region this stroke lays down: brush.region, or 0 on a right-drag (erase)
+let pendingPaintMove = null;   // latest paint-mode pointermove; raycast once per frame, not per event
+let regionsDirty = false;      // unsaved mask/palette edits; the panel offers Save/Revert while set
+let regionIndex = null;        // Uint8Array, one per vertex; 0 = unpainted
+let regionColorAttr = null;    // THREE 'color' BufferAttribute on the geometry
+let regionSurfAttr = null;     // per-vertex (use, metalness, roughness) for regions with their own material
+let isolated = -1;             // region highlighted alone; -1 = show all
+let paintGrid = null;          // uniform spatial grid over vertices, so the brush is O(nearby), not O(all)
+let highlightAttr = null;      // per-vertex 0/1 mask (aHighlight) driving the on-model glow overlay
+let overlayMesh = null;        // additive glow of the isolated region, drawn over the LIT model
+const brush = {
+    region: 1,
+    radius: 0.10,   // as a fraction of the model radius (brush mode)
+    mode: 'brush',  // 'brush' drags a sphere; 'fill' flood-fills the clicked surface patch
+    fillAngle: 30,  // fill spreads while faces stay within this many degrees of the clicked face
+};
+let fillTopology = null;       // lazily built face adjacency + normals for the fill tool
+
+let brushCursor = null;               // ring showing the brush footprint on the surface while painting
+const Z_AXIS = new THREE.Vector3(0, 0, 1);
+
+function ensureBrushCursor() {
+    if (brushCursor) return;
+    // A thin ring (unit outer radius) laid flat on the surface. Unlit and depth-test off so it stays
+    // visible over both the light clay and any dark/coloured regions, never hidden by the geometry.
+    const mat = new THREE.MeshBasicMaterial({
+        color: 0xffffff, transparent: true, opacity: 0.85,
+        depthTest: false, depthWrite: false, side: THREE.DoubleSide, toneMapped: false,
+    });
+    brushCursor = new THREE.Mesh(new THREE.RingGeometry(0.86, 1.0, 48), mat);
+    brushCursor.renderOrder = 3;      // over the model and the region glow overlay
+    brushCursor.frustumCulled = false;
+    brushCursor.visible = false;
+    scene.add(brushCursor);
+}
+
+/// Lays the brush ring on the surface at a raycast hit (sized to the brush), or hides it when there
+/// is no hit, we're not in paint mode, or the fill tool is active (a radius ring would mislead).
+function updateBrushCursor(hit) {
+    if (!paintMode || !hit || !mesh || brush.mode === 'fill') { if (brushCursor) brushCursor.visible = false; return; }
+    ensureBrushCursor();
+    const nrm = (hit.face
+        ? hit.face.normal.clone().transformDirection(mesh.matrixWorld)
+        : camera.getWorldDirection(new THREE.Vector3()).negate()).normalize();
+    brushCursor.position.copy(hit.point).addScaledVector(nrm, modelRadius * 0.003); // lift off z-fighting
+    brushCursor.quaternion.setFromUnitVectors(Z_AXIS, nrm);
+    const rad = brush.radius * modelRadius;
+    brushCursor.scale.set(rad, rad, 1);
+    brushCursor.visible = true;
+}
+
+// A light clay grey for unpainted surface: lit in paint mode (see below) it reads as a grey model
+// whose shape and surface detail are clearly visible, while the coloured regions stand out on top.
+const NEUTRAL = new THREE.Color('#9298a0');
+
+const DEFAULT_PALETTE = [
+    { name: 'Armour',  color: '#3f6fd0', material: 'look' },
+    { name: 'Cloth',   color: '#c0392b', material: 'look' },
+    { name: 'Skin',    color: '#e0a875', material: 'look' },
+    { name: 'Metal',   color: '#c9a13b', material: 'metal' },
+    { name: 'Leather', color: '#7a4a2e', material: 'look' },
+    { name: 'Base',    color: '#5f6a4a', material: 'look' },
+];
+let regionPalette = DEFAULT_PALETTE.map(r => ({ ...r }));
+let regionThreeColors = buildRegionColors();
+let glowingSlots = new Set(); // region slots powering an enabled glow light — rendered emissive
+
+// Per-region surface finishes (metalness, roughness) — same values as the matching LOOKS presets,
+// so an area set to "metal" gleams exactly like the Silver NMM look does. 'look' (or an unknown /
+// missing value on an older saved mask) means the area has no surface of its own and follows the
+// global look, exactly as before regions had materials.
+const REGION_MATERIALS = {
+    matte: { metalness: 0.0, roughness: 0.85 },
+    satin: { metalness: 0.0, roughness: 0.38 },
+    gloss: { metalness: 0.0, roughness: 0.15 },
+    metal: { metalness: 1.0, roughness: 0.30 },
+};
+
+// (materialUse, metalness, roughness, tintUse) in [0,1] for the normalized aRegionSurf attribute —
+// the setters convert to bytes themselves (BufferAttribute normalize-on-set). EVERY painted vertex
+// tints the lit render with its region colour (tintUse=1); the metalness/roughness override only
+// applies when the slot names a material ('Follow look' keeps the look's surface under the tint).
+function surfFor(idx) {
+    if (idx <= 0) return [0, 0, 0, 0];
+    const slot = regionPalette[idx - 1];
+    const m = slot ? REGION_MATERIALS[slot.material] : undefined;
+    // w: 0 = unpainted, 0.6 = tinted, 1.0 = tinted + EMISSIVE (the region powers a glow light).
+    const w = glowingSlots.has(idx) ? 1.0 : 0.6;
+    return m ? [1, m.metalness, m.roughness, w] : [0, 0, 0, w];
+}
+
+// ---------------------------------------------------------------------------------------------
+// Region surface patch: where a painted region has its own material, override the material's
+// metalness/roughness (and, outside paint mode, its colour) per fragment. Driven by aRegionSurf
+// (use, metalness, roughness — normalized bytes, so 4 bytes/vertex on multi-million-vertex prints)
+// plus the existing per-vertex 'color' attribute as the tint, so no second colour buffer exists.
+// vRegionSurf.x interpolates 1→0 across a region's boundary triangles, giving a soft edge.
+// Only PBR materials get the patch — matcap/toon are fixed stylized references by design.
+// ---------------------------------------------------------------------------------------------
+function applyRegionSurfacePatch(material, useTint) {
+    const prevCompile = material.onBeforeCompile;
+    material.onBeforeCompile = shader => {
+        if (prevCompile) prevCompile(shader);
+
+        shader.vertexShader = shader.vertexShader.replace('void main() {',
+            'attribute vec4 aRegionSurf;\nvarying vec4 vRegionSurf;\n' +
+            (useTint ? 'attribute vec3 color;\nvarying vec3 vRegionTint;\n' : '') +
+            'void main() {\n  vRegionSurf = aRegionSurf;' +
+            (useTint ? '\n  vRegionTint = color;' : ''));
+
+        // The factor assignments live inside unexpanded #includes — expand and patch them, as the
+        // lock-specular patch does for the lights chunk.
+        shader.fragmentShader = shader.fragmentShader
+            .replace('void main() {',
+                'varying vec4 vRegionSurf;\n' + (useTint ? 'varying vec3 vRegionTint;\n' : '') +
+                'void main() {')
+            .replace('#include <metalnessmap_fragment>', THREE.ShaderChunk.metalnessmap_fragment
+                .replace('float metalnessFactor = metalness;',
+                    'float metalnessFactor = mix( metalness, vRegionSurf.y, vRegionSurf.x );'))
+            .replace('#include <roughnessmap_fragment>', THREE.ShaderChunk.roughnessmap_fragment
+                .replace('float roughnessFactor = roughness;',
+                    'float roughnessFactor = mix( roughness, vRegionSurf.z, vRegionSurf.x );'));
+
+        if (useTint) shader.fragmentShader = shader.fragmentShader
+            .replace('#include <color_fragment>',
+                '#include <color_fragment>\n\tdiffuseColor.rgb = mix( diffuseColor.rgb, vRegionTint, step( 0.3, vRegionSurf.w ) );')
+            // Glow-region surfaces emit their own colour, so the source area reads hot under ACES
+            // instead of a passive tint. (w: 0 none, 0.6 tint, 1.0 tint + emissive.)
+            .replace('#include <emissivemap_fragment>',
+                '#include <emissivemap_fragment>\n\ttotalEmissiveRadiance += vRegionTint * ( step( 0.85, vRegionSurf.w ) * 1.4 );');
+    };
+    const prevKey = material.customProgramCacheKey;
+    material.customProgramCacheKey = () =>
+        (prevKey ? prevKey.call(material) : '') + '|regionsurf' + (useTint ? '+tint' : '');
+    return material;
+}
+
+function buildRegionColors() {
+    return [NEUTRAL, ...regionPalette.map(r => new THREE.Color(r.color))];
+}
+
+function resetRegions() {
+    regionIndex = null;
+    regionColorAttr = null;
+    regionSurfAttr = null;
+    paintGrid = null;
+    fillTopology = null; // adjacency belongs to the old geometry
+    highlightAttr = null;
+    isolated = -1;
+    if (overlayMesh) { scene.remove(overlayMesh); overlayMesh.material.dispose(); overlayMesh = null; }
+    if (fillPreviewLine) {
+        scene.remove(fillPreviewLine);
+        fillPreviewLine.geometry.dispose();
+        fillPreviewLine.material.dispose();
+        fillPreviewLine = null;
+    }
+    fillPreview.face = -1;
+}
+
+// The on-model glow: a second mesh sharing the model geometry, drawn additively over the LIT render
+// so the isolated region lights up in place. A per-vertex aHighlight (0/1) selects which vertices
+// glow; depthFunc LEQUAL + no depth write lets it sit exactly on the surface without z-fighting.
+function ensureHighlightOverlay() {
+    if (!mesh) return;
+    const count = mesh.geometry.attributes.position.count;
+    if (!highlightAttr || highlightAttr.count !== count) {
+        highlightAttr = new THREE.Float32BufferAttribute(new Float32Array(count), 1);
+        highlightAttr.setUsage(THREE.DynamicDrawUsage);
+        mesh.geometry.setAttribute('aHighlight', highlightAttr);
+    }
+    if (!overlayMesh) {
+        const material = new THREE.ShaderMaterial({
+            uniforms: { uColor: { value: new THREE.Color('#ffffff') } },
+            // A solid tint plus a bright fresnel rim, so the region reads as "glowing" even on a
+            // bright metallic look where a flat additive tint would wash out.
+            vertexShader:
+                'attribute float aHighlight;\nvarying float vH;\nvarying vec3 vN;\nvarying vec3 vViewPos;\n' +
+                'void main() {\n' +
+                '  vH = aHighlight;\n' +
+                '  vec4 mv = modelViewMatrix * vec4( position, 1.0 );\n' +
+                '  vViewPos = mv.xyz;\n' +
+                '  vN = normalMatrix * normal;\n' +
+                '  gl_Position = projectionMatrix * mv;\n' +
+                '}',
+            fragmentShader:
+                'varying float vH;\nvarying vec3 vN;\nvarying vec3 vViewPos;\nuniform vec3 uColor;\n' +
+                'void main() {\n' +
+                '  if ( vH < 0.5 ) discard;\n' +
+                '  float fres = pow( 1.0 - max( dot( normalize( vN ), normalize( -vViewPos ) ), 0.0 ), 2.0 );\n' +
+                // Alpha-blend (not additive) so the region reads on a bright surface too: it tints
+                // toward the region colour, opaque at the fresnel rim for a lit-up edge.
+                '  gl_FragColor = vec4( uColor, clamp( 0.55 + 0.45 * fres, 0.0, 1.0 ) );\n' +
+                '}',
+            transparent: true,
+            depthWrite: false,
+            // Shares the model's exact geometry; nudge toward the camera so the tint wins the depth
+            // test on the front surface but stays occluded on the far side.
+            polygonOffset: true,
+            polygonOffsetFactor: -1,
+            polygonOffsetUnits: -1,
+        });
+        overlayMesh = new THREE.Mesh(mesh.geometry, material);
+        overlayMesh.renderOrder = 2;      // after the lit model
+        overlayMesh.frustumCulled = false;
+        scene.add(overlayMesh);
+    }
+    overlayMesh.visible = false;
+}
+
+/// A uniform grid bucketing vertices by cell, so the brush only tests vertices near the hit point
+/// instead of the whole mesh — the difference between a smooth brush and a frozen one on dense STLs.
+/// Built lazily and invalidated whenever the geometry moves (load, reorient).
+function buildPaintGrid() {
+    const pos = mesh.geometry.attributes.position;
+    const n = pos.count;
+    const bb = new THREE.Box3().setFromBufferAttribute(pos);
+    const size = new THREE.Vector3();
+    bb.getSize(size);
+
+    const perAxis = Math.min(100, Math.max(8, Math.round(Math.cbrt(n) / 2)));
+    const cell = Math.max(1e-4, Math.max(size.x, size.y, size.z) / perAxis);
+    const nx = Math.max(1, Math.floor(size.x / cell) + 1);
+    const ny = Math.max(1, Math.floor(size.y / cell) + 1);
+    const nz = Math.max(1, Math.floor(size.z / cell) + 1);
+    const cellCount = nx * ny * nz;
+
+    const cellOf = (x, y, z) => {
+        const ix = Math.min(nx - 1, Math.max(0, Math.floor((x - bb.min.x) / cell)));
+        const iy = Math.min(ny - 1, Math.max(0, Math.floor((y - bb.min.y) / cell)));
+        const iz = Math.min(nz - 1, Math.max(0, Math.floor((z - bb.min.z) / cell)));
+        return (ix * ny + iy) * nz + iz;
+    };
+
+    // Counting sort into a flat items array (recompute the cell index rather than store it per vertex).
+    const start = new Int32Array(cellCount + 1);
+    for (let i = 0; i < n; i++) start[cellOf(pos.getX(i), pos.getY(i), pos.getZ(i)) + 1]++;
+    for (let c = 0; c < cellCount; c++) start[c + 1] += start[c];
+    const cursor = start.slice(0, cellCount);
+    const items = new Int32Array(n);
+    for (let i = 0; i < n; i++) items[cursor[cellOf(pos.getX(i), pos.getY(i), pos.getZ(i))]++] = i;
+
+    paintGrid = { bb, cell, nx, ny, nz, start, items };
+}
+
+function ensureRegionBuffers() {
+    if (!mesh) return;
+    const count = mesh.geometry.attributes.position.count;
+    if (regionIndex && regionIndex.length === count && regionColorAttr) return;
+    regionIndex = new Uint8Array(count);
+    const colors = new Float32Array(count * 3);
+    for (let i = 0; i < count; i++) { colors[i * 3] = NEUTRAL.r; colors[i * 3 + 1] = NEUTRAL.g; colors[i * 3 + 2] = NEUTRAL.b; }
+    regionColorAttr = new THREE.BufferAttribute(colors, 3);
+    mesh.geometry.setAttribute('color', regionColorAttr);
+    // Normalized bytes (not floats): 4 bytes/vertex keeps the cost negligible on dense prints.
+    regionSurfAttr = new THREE.BufferAttribute(new Uint8Array(count * 4), 4, true);
+    regionSurfAttr.setUsage(THREE.DynamicDrawUsage);
+    mesh.geometry.setAttribute('aRegionSurf', regionSurfAttr);
+}
+
+function repaintColors() {
+    if (!regionColorAttr) return;
+    // Palette lookups hoisted: this loops over every vertex of a multi-million-vertex print.
+    const surf = regionPalette.map((_, k) => surfFor(k + 1));
+    for (let i = 0; i < regionIndex.length; i++) {
+        const idx = regionIndex[i];
+        const c = regionThreeColors[idx] ?? NEUTRAL;
+        regionColorAttr.setXYZ(i, c.r, c.g, c.b);
+        const s = idx > 0 ? (surf[idx - 1] ?? [0, 0, 0, 0]) : [0, 0, 0, 0];
+        regionSurfAttr.setXYZW(i, s[0], s[1], s[2], s[3]);
+    }
+    regionColorAttr.needsUpdate = true;
+    regionSurfAttr.needsUpdate = true;
+}
+
+function paintAt(worldPoint) {
+    if (!regionColorAttr) return;
+    if (!paintGrid) buildPaintGrid();
+    regionsDirty = true;
+
+    const local = mesh.worldToLocal(worldPoint.clone());
+    const pos = mesh.geometry.attributes.position;
+    const r = brush.radius * modelRadius, r2 = r * r;
+    const paintR = strokeRegion; // brush.region for a left stroke, 0 (erase) for a right-drag
+    const c = regionThreeColors[paintR] ?? NEUTRAL;
+    const s = surfFor(paintR); // the region's own surface (or none), baked alongside its colour
+    const highlightVal = paintR === isolated ? 1 : 0; // keep an active glow in sync with new paint
+
+    const g = paintGrid, bb = g.bb;
+    const cellRange = (v, lo, hi) => Math.min(hi - 1, Math.max(0, Math.floor((v - lo) / g.cell)));
+    const ix0 = cellRange(local.x - r, bb.min.x, g.nx), ix1 = cellRange(local.x + r, bb.min.x, g.nx);
+    const iy0 = cellRange(local.y - r, bb.min.y, g.ny), iy1 = cellRange(local.y + r, bb.min.y, g.ny);
+    const iz0 = cellRange(local.z - r, bb.min.z, g.nz), iz1 = cellRange(local.z + r, bb.min.z, g.nz);
+
+    for (let ix = ix0; ix <= ix1; ix++)
+    for (let iy = iy0; iy <= iy1; iy++)
+    for (let iz = iz0; iz <= iz1; iz++) {
+        const cellId = (ix * g.ny + iy) * g.nz + iz;
+        for (let k = g.start[cellId]; k < g.start[cellId + 1]; k++) {
+            const i = g.items[k];
+            const dx = pos.getX(i) - local.x, dy = pos.getY(i) - local.y, dz = pos.getZ(i) - local.z;
+            if (dx * dx + dy * dy + dz * dz <= r2) {
+                if (strokeDiff && !strokeDiff.has(i)) strokeDiff.set(i, regionIndex[i]);
+                regionIndex[i] = paintR;
+                regionColorAttr.setXYZ(i, c.r, c.g, c.b);
+                regionSurfAttr.setXYZW(i, s[0], s[1], s[2], s[3]);
+                if (highlightAttr) highlightAttr.setX(i, highlightVal);
+            }
+        }
+    }
+    regionColorAttr.needsUpdate = true;
+    regionSurfAttr.needsUpdate = true;
+    if (highlightAttr && isolated >= 0) highlightAttr.needsUpdate = true;
+}
+
+// ----- Fill tool -------------------------------------------------------------------------------
+// Click-to-fill: spreads from the clicked face across the surface while faces keep pointing within
+// brush.fillAngle degrees of the clicked face (density-independent, unlike per-edge angles on dense
+// prints), and never crosses a truly sharp edge (a real part boundary). Face adjacency is built
+// once per mesh from welded vertex positions.
+
+function buildFillTopology() {
+    const pos = mesh.geometry.attributes.position;
+    const tris = pos.count / 3;
+
+    // Weld coincident vertices so shared edges connect faces (STL soup shares nothing by index).
+    let minX = Infinity, minY = Infinity, minZ = Infinity, maxDim = 0;
+    for (let i = 0; i < pos.count; i++) {
+        minX = Math.min(minX, pos.getX(i)); minY = Math.min(minY, pos.getY(i)); minZ = Math.min(minZ, pos.getZ(i));
+    }
+    maxDim = modelRadius * 2 || 1;
+    const tol = Math.max(maxDim * 1e-5, 1e-9);
+    const weldMap = new Map();
+    const welded = new Int32Array(pos.count);
+    let unique = 0;
+    for (let i = 0; i < pos.count; i++) {
+        // 2^26-safe packing via multiplication (JS bit-ops are 32-bit only).
+        const qx = Math.round((pos.getX(i) - minX) / tol);
+        const qy = Math.round((pos.getY(i) - minY) / tol);
+        const qz = Math.round((pos.getZ(i) - minZ) / tol);
+        const key = (qx * 2097152 + qy) * 2097152 + qz;
+        let id = weldMap.get(key);
+        if (id === undefined) { id = unique++; weldMap.set(key, id); }
+        welded[i] = id;
+    }
+
+    // Face normals.
+    const normals = new Float32Array(tris * 3);
+    for (let t = 0; t < tris; t++) {
+        const i = t * 3;
+        const ux = pos.getX(i + 1) - pos.getX(i), uy = pos.getY(i + 1) - pos.getY(i), uz = pos.getZ(i + 1) - pos.getZ(i);
+        const vx = pos.getX(i + 2) - pos.getX(i), vy = pos.getY(i + 2) - pos.getY(i), vz = pos.getZ(i + 2) - pos.getZ(i);
+        let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+        const len = Math.hypot(nx, ny, nz) || 1;
+        normals[t * 3] = nx / len; normals[t * 3 + 1] = ny / len; normals[t * 3 + 2] = nz / len;
+    }
+
+    // Edge → adjacent face pairs, as compact adjacency lists. Each entry also carries the shared
+    // edge's two soup-vertex indices so the fill PREVIEW can draw the boundary it stops at.
+    const heads = new Int32Array(tris).fill(-1);
+    const next = new Int32Array(tris * 6);
+    const targets = new Int32Array(tris * 6);
+    const edgeA = new Int32Array(tris * 6);
+    const edgeB = new Int32Array(tris * 6);
+    let cursor = 0;
+    const link = (f1, f2, va, vb) => {
+        targets[cursor] = f2; edgeA[cursor] = va; edgeB[cursor] = vb; next[cursor] = heads[f1]; heads[f1] = cursor++;
+        targets[cursor] = f1; edgeA[cursor] = va; edgeB[cursor] = vb; next[cursor] = heads[f2]; heads[f2] = cursor++;
+    };
+    const edgeMap = new Map();
+    for (let t = 0; t < tris; t++) {
+        for (let k = 0; k < 3; k++) {
+            const va = t * 3 + k, vb = t * 3 + (k + 1) % 3;
+            const a = welded[va], b = welded[vb];
+            if (a === b) continue;
+            const key = (a < b ? a : b) * 67108864 + (a < b ? b : a);
+            const other = edgeMap.get(key);
+            if (other === undefined) edgeMap.set(key, va); // remember one side's soup edge start
+            else if (other >= 0) { link((other / 3) | 0, t, other, ((other % 3) === 2 ? other - 2 : other + 1)); edgeMap.set(key, -1); }
+        }
+    }
+    fillTopology = {
+        tris, normals, heads, next, targets, edgeA, edgeB,
+        visitStamp: new Int32Array(tris), stamp: 0, fillList: new Int32Array(Math.min(tris, 1 << 20)),
+    };
+}
+
+/// The set of faces a fill from seedFace would cover, marked in visitStamp with a fresh stamp.
+/// Returns the count; the face ids are in fillTopology.fillList[0..count-1].
+function computeFillSet(seedFace) {
+    const topo = fillTopology;
+    const { tris, normals, heads, next, targets } = topo;
+    if (seedFace < 0 || seedFace >= tris) return 0;
+
+    const cosCone = Math.cos(Math.min(Math.max(brush.fillAngle, 1), 90) * Math.PI / 180);
+    // Only near-perpendicular edges stop the fill outright (real part boundaries sit at ~90°);
+    // sculpted detail like scales folds up to ~80° face-to-face and must not fence the fill.
+    const cosSharp = Math.cos(88 * Math.PI / 180);
+    const sx = normals[seedFace * 3], sy = normals[seedFace * 3 + 1], sz = normals[seedFace * 3 + 2];
+
+    const stamp = ++topo.stamp;
+    const visited = topo.visitStamp;
+    let list = topo.fillList;
+    let count = 0;
+    const push = f => {
+        if (count === list.length) {
+            const bigger = new Int32Array(Math.min(tris, list.length * 2));
+            bigger.set(list);
+            topo.fillList = list = bigger;
+        }
+        list[count++] = f;
+    };
+
+    visited[seedFace] = stamp;
+    push(seedFace);
+    let head = 0;
+    while (head < count) {
+        const f = list[head++];
+        const fx = normals[f * 3], fy = normals[f * 3 + 1], fz = normals[f * 3 + 2];
+        for (let e = heads[f]; e !== -1; e = next[e]) {
+            const n = targets[e];
+            if (visited[n] === stamp) continue;
+            const nx = normals[n * 3], ny = normals[n * 3 + 1], nz = normals[n * 3 + 2];
+            if (nx * sx + ny * sy + nz * sz < cosCone) continue;  // left the clicked facing
+            if (nx * fx + ny * fy + nz * fz < cosSharp) continue; // crossed a hard part edge
+            visited[n] = stamp;
+            push(n);
+        }
+    }
+    return count;
+}
+
+/// Fills starting at a face (raycast faceIndex) with strokeRegion. Returns faces filled.
+function fillFromFace(seedFace) {
+    if (!regionColorAttr) return 0;
+    if (!fillTopology) buildFillTopology();
+    const count = computeFillSet(seedFace);
+    if (count === 0) return 0;
+
+    const paintR = strokeRegion;
+    const c = regionThreeColors[paintR] ?? NEUTRAL;
+    const s = surfFor(paintR);
+    const highlightVal = paintR === isolated ? 1 : 0;
+    const list = fillTopology.fillList;
+
+    for (let idx = 0; idx < count; idx++) {
+        const t = list[idx];
+        for (let k = 0; k < 3; k++) {
+            const i = t * 3 + k;
+            if (strokeDiff && !strokeDiff.has(i)) strokeDiff.set(i, regionIndex[i]);
+            regionIndex[i] = paintR;
+            regionColorAttr.setXYZ(i, c.r, c.g, c.b);
+            regionSurfAttr.setXYZW(i, s[0], s[1], s[2], s[3]);
+            if (highlightAttr) highlightAttr.setX(i, highlightVal);
+        }
+    }
+
+    regionColorAttr.needsUpdate = true;
+    regionSurfAttr.needsUpdate = true;
+    if (highlightAttr && isolated >= 0) highlightAttr.needsUpdate = true;
+    regionsDirty = true;
+    return count;
+}
+
+// ----- Fill preview: marching-ants boundary of the area a click would fill --------------------
+
+let fillPreviewLine = null;                       // dashed LineSegments overlay
+const fillPreview = { face: -1, angle: -1, time: 0 };
+
+function hideFillPreview() {
+    if (fillPreviewLine) fillPreviewLine.visible = false;
+    fillPreview.face = -1;
+}
+
+/// Recomputes the dashed boundary for a hover face (throttled by the caller).
+function updateFillPreview(seedFace) {
+    if (!fillTopology) buildFillTopology();
+    const topo = fillTopology;
+    const count = computeFillSet(seedFace);
+    if (count === 0) { hideFillPreview(); return; }
+
+    // Boundary = fill-set edges whose neighbour is outside the set; lift each segment slightly
+    // along the face normal so the line doesn't z-fight the surface.
+    const pos = mesh.geometry.attributes.position;
+    const stamp = topo.stamp;
+    const lift = modelRadius * 0.004;
+    const points = [];
+    for (let idx = 0; idx < count; idx++) {
+        const f = topo.fillList[idx];
+        const nx = topo.normals[f * 3] * lift, ny = topo.normals[f * 3 + 1] * lift, nz = topo.normals[f * 3 + 2] * lift;
+        for (let e = topo.heads[f]; e !== -1; e = topo.next[e]) {
+            if (topo.visitStamp[topo.targets[e]] === stamp) continue; // interior edge
+            const a = topo.edgeA[e], b = topo.edgeB[e];
+            points.push(pos.getX(a) + nx, pos.getY(a) + ny, pos.getZ(a) + nz,
+                        pos.getX(b) + nx, pos.getY(b) + ny, pos.getZ(b) + nz);
+        }
+    }
+
+    if (points.length === 0) { hideFillPreview(); return; }
+    if (!fillPreviewLine) {
+        const material = new THREE.LineDashedMaterial({
+            color: 0xffffff, dashSize: modelRadius * 0.02, gapSize: modelRadius * 0.012,
+            depthTest: false, transparent: true, opacity: 0.95, toneMapped: false,
+        });
+        fillPreviewLine = new THREE.LineSegments(new THREE.BufferGeometry(), material);
+        fillPreviewLine.renderOrder = 4; // over the model, the glow overlay and the brush ring
+        fillPreviewLine.frustumCulled = false;
+        scene.add(fillPreviewLine);
+    }
+    fillPreviewLine.geometry.dispose();
+    fillPreviewLine.geometry = new THREE.BufferGeometry();
+    fillPreviewLine.geometry.setAttribute('position', new THREE.Float32BufferAttribute(points, 3));
+    fillPreviewLine.computeLineDistances(); // dashes need cumulative distances
+    fillPreviewLine.visible = true;
+}
+
+/// Dev/tuning hook: run a fill outside the pointer pipeline. Returns the filled face count.
+export function __debugFill(faceIndex, region, angleDeg) {
+    ensureRegionBuffers();
+    strokeRegion = region | 0;
+    brush.fillAngle = angleDeg;
+    strokeDiff = null;
+    return fillFromFace(faceIndex | 0);
+}
+
+/// Enter/leave paint mode. Paint mode swaps to a LIT vertex-colour material — so the model keeps its
+/// shape and surface detail while the coloured regions tint it — rather than a flat unlit fill.
+export function setPaintMode(on) {
+    paintMode = !!on;
+    if (!mesh) return;
+    if (paintMode) {
+        ensureRegionBuffers();
+        repaintColors();
+        // The look material may predate the region buffers (unpainted model) — rebuild it now so it
+        // carries the region-surface patch when we swap back on exit.
+        if (lookMaterial && !lookMaterial.userData.regionPatch && regionSurfAttr) rebuildLookMaterial();
+        // MeshStandard (not MeshBasic) so the studio lights still shade the geometry: you can read
+        // scales/folds and where the brush is landing. Vertex colours multiply through as the regions.
+        // The region-surface patch (no tint — vertex colours already carry the region colour) makes a
+        // metal area gleam while you paint, so material changes give immediate feedback.
+        mesh.material = ensurePaintMaterial();
+    } else {
+        // Keep any active region glow — showing it on the LIT model is the whole point.
+        if (brushCursor) brushCursor.visible = false;
+        hideFillPreview();
+        mesh.material = lookMaterial ?? rebuildLookMaterial(); // swap, don't rebuild — the program stays warm
+        refreshRegionLights(); // painting may have moved/recoloured a glow light's region
+    }
+}
+
+export function getPaintMode() { return paintMode; }
+
+export function setBrush(opts) {
+    if (opts.region !== undefined) brush.region = opts.region | 0;
+    if (opts.radius !== undefined) brush.radius = Math.max(0.02, Math.min(0.4, opts.radius));
+    if (opts.mode !== undefined) brush.mode = opts.mode === 'fill' ? 'fill' : 'brush';
+    if (opts.fillAngle !== undefined) {
+        brush.fillAngle = Math.max(1, Math.min(90, opts.fillAngle));
+        fillPreview.angle = -1;                                   // slider moved: preview is stale
+        if (lastPaintHover) pendingPaintMove = lastPaintHover;    // refresh without a mouse move
+    }
+    if (brush.mode === 'fill') {
+        if (brushCursor) brushCursor.visible = false; // the ring is brush-sized; misleading for fill
+    } else {
+        hideFillPreview();
+    }
+}
+
+/// Glow one region in place on whatever's showing (works on the LIT look, not just the flat view).
+export function highlightRegion(index) {
+    isolated = index | 0;
+    if (!regionIndex) return;
+    ensureHighlightOverlay();
+    for (let i = 0; i < regionIndex.length; i++) highlightAttr.setX(i, regionIndex[i] === isolated ? 1 : 0);
+    highlightAttr.needsUpdate = true;
+    const col = regionThreeColors[isolated] ?? NEUTRAL;
+    overlayMesh.material.uniforms.uColor.value.copy(col);
+    overlayMesh.visible = true;
+}
+
+export function showAllRegions() {
+    isolated = -1;
+    if (overlayMesh) overlayMesh.visible = false;
+}
+
+export function clearRegions() {
+    if (!regionIndex) return;
+    const diff = new Map(); // so Clear is undoable too
+    for (let i = 0; i < regionIndex.length; i++) if (regionIndex[i] !== 0) diff.set(i, regionIndex[i]);
+    pushPaintUndo(diff);
+    regionIndex.fill(0);
+    isolated = -1;
+    if (highlightAttr) { highlightAttr.array.fill(0); highlightAttr.needsUpdate = true; }
+    if (overlayMesh) overlayMesh.visible = false;
+    repaintColors();
+    regionsDirty = true;
+    notifyChanged();
+}
+
+export function setRegionPalette(json) {
+    regionPalette = JSON.parse(json);
+    regionThreeColors = buildRegionColors();
+    // Rebake unconditionally (not just in paint mode): colours and surfaces feed the LIT look too,
+    // so changing an area's material (or colour) shows on the model immediately.
+    if (regionIndex) {
+        repaintColors();
+        refreshRegionLights(); // a recoloured slot recolours its glow light
+        regionsDirty = true; // the palette persists inside the mask blob
+        // Attribute-only updates reliably appear on the paint material, but have been observed to
+        // NOT appear while the LOOK material keeps rendering (headless repro; cause in three's
+        // binding internals unproven). Outside paint mode the palette changes only rarely (Revert),
+        // so rebuild the look there — the proven-correct path — instead of trusting the update.
+        if (!paintMode && mesh) rebuildLookMaterial();
+    }
+    if (isolated >= 0) highlightRegion(isolated); // refresh the glow colour
+}
+
+export function getRegionPalette() {
+    return JSON.stringify(regionPalette);
+}
+
+/// Dev/tuning: rebuild the model material from explicit pieces, to bisect patch interactions.
+/// Replaces the cached look material so subsequent paint-mode toggles don't clobber it.
+export function __debugBuildMaterial(opts) {
+    if (!mesh) return 'no mesh';
+    let material = new THREE.MeshPhysicalMaterial({
+        color: new THREE.Color(appearance.color),
+        metalness: appearance.metalness, roughness: appearance.roughness,
+        clearcoat: appearance.clearcoat,
+        envMapIntensity: (appearance.envIntensity ?? 0.4) * ambientEnvScale()
+    });
+    if (opts.studio) material = applyStudioShaderPatches(material);
+    if (opts.region) material = applyRegionSurfacePatch(material, opts.tint !== false);
+    lookMaterial?.dispose();
+    lookMaterial = material;
+    lookMaterial.userData.regionPatch = !!opts.region;
+    mesh.material = lookMaterial;
+    return material.customProgramCacheKey ? material.customProgramCacheKey() : 'default-key';
+}
+
+/// Dev/tuning introspection: is the region-surface pipeline live on the current material?
+export function getRegionDebug() {
+    let firstUse = -1;
+    if (regionSurfAttr) {
+        const a = regionSurfAttr.array;
+        for (let i = 0; i < a.length; i += 4) if (a[i] !== 0) { firstUse = i / 4; break; }
+    }
+    const shader = mesh?.material?.userData?.studioShader;
+    return JSON.stringify({
+        paintMode,
+        hasSurfAttr: !!regionSurfAttr,
+        firstUseVertex: firstUse,
+        materialKey: mesh?.material?.customProgramCacheKey?.() ?? null,
+        paletteMaterials: regionPalette.map(r => r.material ?? null),
+        // Did the region patch actually land in the compiled source?
+        vertHasAttr: shader?.vertexShader?.includes('aRegionSurf') ?? null,
+        fragHasMetalMix: shader?.fragmentShader?.includes('vRegionSurf.y') ?? null,
+        fragHasTint: shader?.fragmentShader?.includes('vRegionTint') ?? null,
+        // …and does the LINKED program actually use the attribute, or was it eliminated?
+        activeAttrs: (() => {
+            try {
+                const prog = renderer?.properties?.get(mesh.material)?.currentProgram;
+                return prog ? Object.keys(prog.getAttributes()) : null;
+            } catch { return null; }
+        })()
+    });
+}
+
+/// Painted-vertex count per region index (0..N) so the panel can show what's covered.
+export function getRegionCounts() {
+    const counts = new Array(regionPalette.length + 1).fill(0);
+    if (regionIndex) for (let i = 0; i < regionIndex.length; i++) counts[regionIndex[i]]++;
+    return JSON.stringify(counts);
+}
+
+/// The whole mask as a JSON blob (or null when nothing is painted) — persisted per model.
+export function getRegions() {
+    if (!regionIndex || !regionIndex.some(v => v !== 0)) return null;
+    return JSON.stringify({ version: 1, count: regionIndex.length, palette: regionPalette, data: u8ToBase64(regionIndex) });
+}
+
+export function setRegions(json) {
+    if (!json || !mesh) return;
+    let data;
+    try { data = JSON.parse(json); } catch { return; }
+    if (!data || data.count !== mesh.geometry.attributes.position.count) return; // stale mask; ignore
+    if (Array.isArray(data.palette)) { regionPalette = data.palette; regionThreeColors = buildRegionColors(); }
+    ensureRegionBuffers();
+    regionIndex.set(base64ToU8(data.data).subarray(0, regionIndex.length));
+    repaintColors(); // always: region surfaces show on the lit look, not only in paint mode
+    // The look material was built before the region buffers existed — rebuild it so the
+    // region-surface patch attaches and saved areas with their own material show right away.
+    if (lookMaterial && !lookMaterial.userData.regionPatch) rebuildLookMaterial();
+    refreshRegionLights(); // glow lights follow the loaded mask
+    regionsDirty = false; // what was just loaded IS the saved state
+}
+
+/// Unsaved mask/palette edits? The panel shows Save/Revert while true.
+export function isRegionsDirty() {
+    return regionsDirty;
+}
+
+/// The panel persisted the mask — edits up to this point are no longer "unsaved".
+export function markRegionsSaved() {
+    regionsDirty = false;
+}
+
+/// The panel applied a mask that is NOT what's saved (auto-detect proposal) — offer Save/Revert.
+export function markRegionsEdited() {
+    regionsDirty = true;
+}
+
+function u8ToBase64(u8) {
+    let out = '';
+    const chunk = 0x8000; // fromCharCode.apply can't take a whole 1M array at once
+    for (let i = 0; i < u8.length; i += chunk)
+        out += String.fromCharCode.apply(null, u8.subarray(i, i + chunk));
+    return btoa(out);
+}
+
+function base64ToU8(b64) {
+    const bin = atob(b64);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return u8;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Imported STLs (scene props) — bring extra models in to light a composed scene (base + mini +
+// scenery). Each is a movable/rotatable mesh, lit like the model but WITHOUT region painting.
+// Session-scoped for now: save a screenshot to keep the composition (transforms aren't persisted
+// with the light rig yet).
+// ---------------------------------------------------------------------------------------------
+
+export function addStl(bytes, name, modelId, transformJson) {
+    if (!renderer) return 0;
+    const geometry = new STLLoader().parse(bytes.buffer ?? bytes);
+    geometry.computeVertexNormals();
+    geometry.rotateX(-Math.PI / 2);                       // match the model's Z-up→Y-up convention
+    geometry.scale(modelScale, modelScale, modelScale);   // keep size relative to the primary model
+    geometry.center();                                    // so it rotates about its own centre
+    geometry.computeBoundingSphere();
+
+    const propMesh = new THREE.Mesh(geometry, buildMaterial(false));
+    propMesh.castShadow = true;
+    propMesh.receiveShadow = true;
+
+    let transform = null;
+    if (transformJson) { try { transform = JSON.parse(transformJson); } catch { /* fresh placement */ } }
+    if (transform?.position && transform?.quaternion) {
+        propMesh.position.fromArray(transform.position);   // restore a saved scene
+        propMesh.quaternion.fromArray(transform.quaternion);
+    } else {
+        // Fresh import: drop it beside the model at ground level, not buried inside the sculpt.
+        const r = geometry.boundingSphere.radius;
+        propMesh.position.set(modelRadius + r, r, 0);
+    }
+    scene.add(propMesh);
+
+    const id = ++propSeq;
+    propMesh.userData.propId = id;
+    props.set(id, { mesh: propMesh, name: name || `part ${id}`, modelId: modelId || null });
+    if (!transform) selectProp(id); // fresh add selects; a restored prop does not
+    requestShadowUpdate();
+    return id;
+}
+
+function selectProp(id) {
+    const entry = props.get(id);
+    if (!entry) return;
+    if (selectedLightId !== null) selectLight(null); // the two gizmos are mutually exclusive
+    selectedPropId = id;
+    propControl.attach(entry.mesh);
+}
+
+function deselectProp() {
+    selectedPropId = null;
+    propControl.detach();
+}
+
+/// Select a prop from the panel list.
+export function selectPropById(id) { selectProp(id | 0); notifyChanged(); }
+
+/// 'translate' (move) or 'rotate' (turn) for the prop gizmo.
+export function setPropMode(mode) {
+    propControl.setMode(mode === 'rotate' ? 'rotate' : 'translate');
+}
+
+export function deleteProp(id) {
+    const entry = props.get(id | 0);
+    if (!entry) return;
+    if (selectedPropId === (id | 0)) deselectProp();
+    scene.remove(entry.mesh);
+    entry.mesh.geometry.dispose();
+    entry.mesh.material.dispose();
+    props.delete(id | 0);
+    requestShadowUpdate();
+}
+
+/// The scene's imported props for the panel: [{id, name, modelId, selected}].
+export function listProps() {
+    return JSON.stringify([...props.entries()].map(([id, e]) =>
+        ({ id, name: e.name, modelId: e.modelId, selected: id === selectedPropId })));
+}
+
+/// The persistable scene: [{modelId, name, position, quaternion}] for props backed by a model.
+export function getScene() {
+    return JSON.stringify([...props.values()].filter(e => e.modelId).map(e => ({
+        modelId: e.modelId,
+        name: e.name,
+        position: e.mesh.position.toArray(),
+        quaternion: e.mesh.quaternion.toArray()
+    })));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1148,6 +2288,12 @@ export function getAmbientIntensity() {
     return ambientLevel;
 }
 
+/// The whole appearance (shader/look fields, colour, PBR params) — the panel re-syncs from this
+/// after a rig load or undo, so its controls never stomp a freshly restored look with stale values.
+export function getAppearanceJson() {
+    return JSON.stringify(appearance);
+}
+
 /// How many lights are rendering shadow maps right now (diagnostics; point casters cost 6x).
 export function getShadowCasterCount() {
     let count = 0;
@@ -1157,12 +2303,19 @@ export function getShadowCasterCount() {
 }
 
 export function screenshot() {
-    // Captures are reference images — the manipulation arrows must not appear in them.
+    // Captures exclude pure manipulation UI (move arrows, prop gizmos). The light-source orbs are
+    // scene content — the root "light source dots" toggle decides whether they appear, same as in
+    // the live view (a visible lantern orb in a render is a feature; toggle off for a clean plate).
     const arrowsVisible = axisControl?.visible ?? false;
     if (axisControl) axisControl.visible = false;
+    const propArrowsVisible = propControl?.visible ?? false;
+    if (propControl) propControl.visible = false;
+
     requestShadowUpdate();
     renderer.render(scene, camera);
     const dataUrl = renderer.domElement.toDataURL('image/png');
+
     if (axisControl) axisControl.visible = arrowsVisible;
+    if (propControl) propControl.visible = propArrowsVisible;
     return dataUrl;
 }
