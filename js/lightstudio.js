@@ -1,4 +1,4 @@
-// Paint Buddy Light Studio (Architecture v2 §26b).
+// Chromatory Light Studio (Architecture v2 §26b).
 // Client-side WebGL renderer for STL light-placement reference — especially NMM painting.
 // Driven imperatively from Blazor via JS interop; the service never renders anything.
 import * as THREE from 'three';

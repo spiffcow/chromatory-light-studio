@@ -1,4 +1,4 @@
-// Paint Buddy Assembly (Architecture v2 §26c).
+// Chromatory Assembly (Architecture v2 §26c).
 // Client-side workbench for assembling multi-part miniature kits: load several STLs, move and
 // rotate them, snap mating surfaces together, and export one merged STL. Parts are loaded
 // AS-EXPORTED (no recentering) because sculptors usually export parts in the original sculpt's
@@ -782,7 +782,7 @@ export function exportStlBytes() {
 
     const buffer = new ArrayBuffer(84 + totalTris * 50);
     const out = new Uint8Array(buffer);
-    out.set(new TextEncoder().encode('Paint Buddy assembly export'), 0);
+    out.set(new TextEncoder().encode('Chromatory assembly export'), 0);
     new DataView(buffer).setUint32(80, totalTris, true);
 
     const scratch = new Float32Array(12);
@@ -810,7 +810,7 @@ export function exportStlBytes() {
     return out;
 }
 
-/// Uploads the merged STL (e.g. as a Paint Buddy project model) without the bytes ever passing
+/// Uploads the merged STL (e.g. as a Chromatory project model) without the bytes ever passing
 /// through the .NET side — Blazor supplies the URL and auth header, fetch does the rest.
 export async function uploadMerged(url, headerName, headerValue, filename) {
     status('building the merged STL…');
