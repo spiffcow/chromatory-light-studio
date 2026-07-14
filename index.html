@@ -136,6 +136,37 @@
     </div>
     <div id="lights"></div>
 
+    <div id="regionsSection" style="display:none">
+        <h2>Regions</h2>
+        <div class="muted small">Paint areas on the model (armour, cloth, skin…), then light one up on the render.</div>
+        <div class="row">
+            <button class="ghost" id="paintToggle"
+                title="Drag on the model to paint the selected area; right-drag erases; orbit on empty space">🎨 Paint regions</button>
+            <span id="paintTools" style="display:none">
+                <button id="brushTool" class="active" title="Drag to paint with a round brush">🖌 Brush</button>
+                <button id="fillTool" class="ghost"
+                    title="Click an area to fill it — spreads until the surface bends past the angle (right-click fills with the eraser)">🪄 Fill</button>
+                <label id="brushSizeRow">Brush <input type="range" id="brushSize" min="0.005" max="0.3" step="0.005" value="0.10"
+                    title="Drag left for a fine detail brush — zoom in to clean up region edges"></label>
+                <label id="fillAngleRow" style="display:none">Angle <input type="range" id="fillAngle" min="5" max="60" step="1" value="30"><span id="fillAngleVal">30</span>°</label>
+                <button class="ghost" id="clearRegions" title="Erase every painted region">Clear</button>
+            </span>
+            <span class="muted small" id="regionStatus"></span>
+        </div>
+        <div class="row" id="paletteRow" style="display:none"></div>
+        <details id="paletteEdit" style="display:none;margin-top:4px">
+            <summary class="muted small">Rename / recolour areas</summary>
+            <div id="paletteEditList" style="display:flex;flex-direction:column;gap:4px;margin-top:6px"></div>
+            <button class="ghost" id="addRegion" style="margin-top:6px">+ Add area</button>
+        </details>
+        <div class="row" id="lightUpRow" style="display:none"></div>
+        <div class="row">
+            <button id="saveRegions">💾 Save areas…</button>
+            <button id="loadRegions">📂 Load areas</button>
+            <input type="file" id="regionsFile" accept=".json" style="display:none" />
+        </div>
+    </div><!-- /regionsSection -->
+
     <div id="sceneSection" style="display:none">
         <h2>Scene</h2>
         <div class="muted small">Add more STLs to light a composed scene (a base, scenery, a second
@@ -173,10 +204,10 @@
     import * as studio from './js/lightstudio.js';
 
     // Release feature flags for the STANDALONE build — edited per release, applied at load.
-    // regions: the in-app region painting / fill / glow-region tools stay app-only for now.
+    // regions: paint areas on the model (armour, cloth, skin…), then glow one on the render.
     // assembly: links the Assembly workbench (published under /assembly/ by the deploy script).
     // multiStl: the Scene section — add extra STLs as movable props to light a composed scene.
-    const FEATURES = { regions: false, assembly: true, multiStl: true };
+    const FEATURES = { regions: true, assembly: true, multiStl: true };
 
     const $ = id => document.getElementById(id);
     const status = $('loadstatus');
@@ -184,6 +215,7 @@
     studio.init($('canvas'));
     $('assemblyLink').style.display = FEATURES.assembly ? '' : 'none';
     $('sceneSection').style.display = FEATURES.multiStl ? '' : 'none';
+    $('regionsSection').style.display = FEATURES.regions ? '' : 'none';
 
     // ---- STL loading (file picker + drag & drop, no size limit — it never leaves the client)
     async function loadFile(file) {
@@ -196,6 +228,7 @@
             const triangles = studio.loadStl(bytes);
             status.textContent = `${file.name} — ${triangles.toLocaleString()} triangles`;
             refreshLights();
+            onModelReplaced();
         } catch (error) {
             status.textContent = `couldn't read that STL: ${error.message}`;
         }
@@ -418,6 +451,161 @@
         $('propRotate').addEventListener('click', () => setPropMode('rotate'));
     }
 
+    // ---- Regions (paint areas on the model, then glow one on the render). Uses the SAME engine
+    // API as the in-app studio; painting persists via Save/Load areas (JSON), not the rig.
+    let palette = [];   // [{ name, color, material, metalness?, roughness? }]
+    let painting = false, brushRegion = 1, fillMode = false, brushRadius = 0.10, fillAngle = 30, highlighted = -1;
+
+    const loadPalette = () => { palette = JSON.parse(studio.getRegionPalette()); };
+    const regionCounts = () => { try { return JSON.parse(studio.getRegionCounts()); } catch { return []; } };
+
+    function pushPalette() {
+        studio.setRegionPalette(JSON.stringify(palette.map(s => ({
+            name: s.name, color: s.color, material: s.material ?? 'look',
+            metalness: s.metalness ?? null, roughness: s.roughness ?? null }))));
+        renderPalette();
+        renderLightUp();
+    }
+
+    function renderPalette() {
+        // Which region the brush paints (+ eraser).
+        const row = $('paletteRow');
+        row.innerHTML = '';
+        palette.forEach((slot, i) => {
+            const idx = i + 1;
+            const button = document.createElement('button');
+            button.className = brushRegion === idx ? 'active' : 'ghost';
+            button.style.borderLeft = `14px solid ${slot.color}`;
+            button.textContent = slot.name;
+            button.title = `Paint with ${slot.name}`;
+            button.addEventListener('click', () => { brushRegion = idx; studio.setBrush({ region: idx }); renderPalette(); });
+            row.appendChild(button);
+        });
+        const eraser = document.createElement('button');
+        eraser.className = brushRegion === 0 ? 'active' : 'ghost';
+        eraser.textContent = 'Eraser';
+        eraser.title = 'Erase back to unpainted';
+        eraser.addEventListener('click', () => { brushRegion = 0; studio.setBrush({ region: 0 }); renderPalette(); });
+        row.appendChild(eraser);
+
+        // Rename / recolour / material per area.
+        const list = $('paletteEditList');
+        list.innerHTML = '';
+        palette.forEach((slot, i) => {
+            const wrap = document.createElement('div');
+            wrap.className = 'row';
+            wrap.style.cssText = 'gap:6px;align-items:center;flex-wrap:wrap';
+
+            const color = document.createElement('input');
+            color.type = 'color'; color.value = slot.color;
+            color.style.cssText = 'width:34px;height:28px;padding:0;border:none;background:none;cursor:pointer';
+            color.addEventListener('input', () => { palette[i].color = color.value; pushPalette(); });
+
+            const name = document.createElement('input');
+            name.type = 'text'; name.value = slot.name; name.style.maxWidth = '150px';
+            name.addEventListener('input', () => { palette[i].name = name.value; pushPalette(); });
+
+            const material = document.createElement('select');
+            material.title = 'How this area reflects light — metal gleams, matte stays flat';
+            for (const [val, txt] of [['look', 'Follow look'], ['matte', 'Matte'], ['satin', 'Satin'], ['gloss', 'Gloss'], ['metal', 'Metal']]) {
+                const opt = document.createElement('option'); opt.value = val; opt.textContent = txt; material.appendChild(opt);
+            }
+            material.value = slot.material ?? 'look';
+            material.addEventListener('change', () => {
+                palette[i].material = material.value; palette[i].metalness = null; palette[i].roughness = null; pushPalette();
+            });
+
+            wrap.append(color, name, material);
+            list.appendChild(wrap);
+        });
+    }
+
+    function renderLightUp() {
+        const counts = regionCounts();
+        const row = $('lightUpRow');
+        row.innerHTML = '';
+        const painted = palette.map((_, i) => i + 1).filter(idx => (counts[idx] ?? 0) > 0);
+        row.style.display = painted.length ? '' : 'none';
+        if (!painted.length) { if (highlighted !== -1) { highlighted = -1; studio.showAllRegions(); } return; }
+        const label = document.createElement('span');
+        label.className = 'muted small'; label.textContent = 'Light up:';
+        row.appendChild(label);
+        for (const idx of painted) {
+            const slot = palette[idx - 1];
+            const button = document.createElement('button');
+            button.className = highlighted === idx ? 'active' : 'ghost';
+            button.style.borderLeft = `12px solid ${slot.color}`;
+            button.textContent = slot.name;
+            button.title = `Glow ${slot.name} on the model`;
+            button.addEventListener('click', () => { highlighted = idx; studio.highlightRegion(idx); renderLightUp(); });
+            row.appendChild(button);
+        }
+        const off = document.createElement('button');
+        off.className = 'ghost'; off.textContent = 'Off'; off.title = 'Turn the glow off';
+        off.addEventListener('click', () => { highlighted = -1; studio.showAllRegions(); renderLightUp(); });
+        row.appendChild(off);
+    }
+
+    // Loading a new STL resets the mask and drops the engine out of paint mode — mirror that here.
+    function onModelReplaced() {
+        if (!FEATURES.regions) return;
+        painting = false; highlighted = -1;
+        $('paintToggle').className = 'ghost';
+        $('paintToggle').textContent = '🎨 Paint regions';
+        $('paintTools').style.display = 'none';
+        $('paletteRow').style.display = 'none';
+        $('paletteEdit').style.display = 'none';
+        renderLightUp();
+    }
+
+    if (FEATURES.regions) {
+        $('paintToggle').addEventListener('click', () => {
+            painting = !painting;
+            studio.setPaintMode(painting);
+            if (painting) studio.setBrush({ region: brushRegion, radius: brushRadius, mode: fillMode ? 'fill' : 'brush', fillAngle });
+            $('paintToggle').className = painting ? 'primary' : 'ghost';
+            $('paintToggle').textContent = painting ? '🎨 Painting — drag paints, right-drag erases' : '🎨 Paint regions';
+            $('paintTools').style.display = painting ? '' : 'none';
+            $('paletteRow').style.display = painting ? '' : 'none';
+            $('paletteEdit').style.display = painting ? '' : 'none';
+            renderPalette();
+            renderLightUp();
+        });
+        const setTool = () => {
+            $('brushTool').className = fillMode ? 'ghost' : 'active';
+            $('fillTool').className = fillMode ? 'active' : 'ghost';
+            $('brushSizeRow').style.display = fillMode ? 'none' : '';
+            $('fillAngleRow').style.display = fillMode ? '' : 'none';
+            studio.setBrush({ radius: brushRadius, mode: fillMode ? 'fill' : 'brush', fillAngle });
+        };
+        $('brushTool').addEventListener('click', () => { fillMode = false; setTool(); });
+        $('fillTool').addEventListener('click', () => { fillMode = true; setTool(); });
+        $('brushSize').addEventListener('input', () => { brushRadius = parseFloat($('brushSize').value); studio.setBrush({ radius: brushRadius }); });
+        $('fillAngle').addEventListener('input', () => {
+            fillAngle = parseInt($('fillAngle').value, 10); $('fillAngleVal').textContent = fillAngle; studio.setBrush({ fillAngle });
+        });
+        $('clearRegions').addEventListener('click', () => { studio.clearRegions(); highlighted = -1; renderLightUp(); });
+        $('addRegion').addEventListener('click', () => {
+            palette.push({ name: `Area ${palette.length + 1}`, color: '#8a8f98', material: 'look' });
+            pushPalette();
+        });
+        $('saveRegions').addEventListener('click', () => {
+            const json = studio.getRegions();
+            if (!json) { $('regionStatus').textContent = 'nothing painted yet'; return; }
+            saveBlob(new Blob([json], { type: 'application/json' }), 'regions.json', 'Painted regions', 'application/json', '.json');
+        });
+        $('loadRegions').addEventListener('click', () => $('regionsFile').click());
+        $('regionsFile').addEventListener('change', async () => {
+            const file = $('regionsFile').files[0];
+            if (!file) return;
+            try { studio.setRegions(await file.text()); loadPalette(); renderPalette(); renderLightUp(); $('regionStatus').textContent = ''; }
+            catch (error) { $('regionStatus').textContent = `couldn't load: ${error.message}`; }
+            $('regionsFile').value = '';
+        });
+        // A finished brush stroke / fill changes the painted counts — refresh the "Light up" row.
+        $('canvas').addEventListener('pointerup', () => { if (painting) renderLightUp(); });
+    }
+
     function syncShadowRow() {
         $('shadowTintRow').style.display = $('shadows').checked ? '' : 'none';
     }
@@ -483,6 +671,7 @@
         syncLockButton();
         refreshLights();
         refreshProps();
+        if (FEATURES.regions) renderLightUp(); // undo of a stroke changes the painted counts
     }
 
     $('rigFile').addEventListener('change', async () => {
@@ -504,6 +693,7 @@
     refreshLights();
     refreshProps();
     syncShadowRow();
+    if (FEATURES.regions) { loadPalette(); renderPalette(); renderLightUp(); }
 
     // News badge: highlighted until the news page for this version has been opened once.
     if (localStorage.getItem('pb-news-seen') !== '2026-07-13') $('newsLink').classList.add('unread');
@@ -523,6 +713,7 @@
             if (userLoadedFile) return; // the visitor beat us to it with their own model
             const triangles = studio.loadStl(bytes);
             refreshLights();
+            onModelReplaced();
             status.textContent = `sample: Bust of Emperor Caracalla (CC0) — ${triangles.toLocaleString()} triangles · drop your own STL to replace`;
         } catch {
             status.textContent = 'binary or ASCII STL · stays on your device';
