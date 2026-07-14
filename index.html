@@ -17,47 +17,38 @@
     <title>Chromatory — Light Studio</title>
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <script type="importmap">{ "imports": { "three": "./lib/three/three.module.js" } }</script>
+    <!-- The SAME stylesheet the Chromatory app uses (copied from the source tree by the deploy
+         script alongside lightstudio.js) — the tabbed section layout, cards, buttons and the
+         two-column studio grid all come from here, so the two never drift. -->
+    <link rel="stylesheet" href="css/app.css" />
     <style>
-        * { box-sizing: border-box; }
-        body { background: #14171a; color: #ddd; font-family: system-ui, sans-serif; margin: 0; }
-        header { max-width: 1060px; margin: 0 auto; padding: 14px 18px 4px; }
-        h1 { font-size: 20px; margin: 0; }
-        .muted { color: #98a4ae; } .small { font-size: 12px; }
-        main { max-width: 1060px; margin: 0 auto; padding: 0 18px 40px; }
-        /* Height-capped so the render never outgrows the window on tall/wide screens. */
-        #canvas { width: min(100%, calc(76vh * 4 / 3)); aspect-ratio: 4/3; margin: 0 auto;
-                  border-radius: 10px; background: #101315; touch-action: none; display: block; }
-        /* Ultrawide: the studio spreads into two columns — the stage stays put on the left
-           while the control panel scrolls on the right. Narrow screens keep the single column. */
-        @media (min-width: 1500px) {
-            header, main { max-width: 1780px; }
-            main { display: grid; grid-template-columns: minmax(0, 1fr) 480px; gap: 26px; align-items: start; }
-            #stage { position: sticky; top: 12px; }
-            main > footer { grid-column: 1 / -1; }
-        }
-        #drop { border: 2px dashed #2d6cdf; border-radius: 10px; padding: 36px 16px; text-align: center; margin: 12px 0; cursor: pointer; }
-        #drop.hover { background: #1a2436; }
-        h2 { font-size: 15px; margin: 16px 0 6px; }
-        .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
-        button {
-            background: #232a31; color: #ddd; border: 1px solid #2a3138; border-radius: 8px;
-            padding: 7px 12px; font-size: 14px; cursor: pointer;
-        }
-        button.primary { background: #2d6cdf; border-color: #2d6cdf; color: #fff; }
-        button.active { background: #2d6cdf; border-color: #2d6cdf; color: #fff; }
-        button.ghost { background: none; }
-        input[type="range"] { accent-color: #2d6cdf; }
-        label { font-size: 13px; color: #98a4ae; display: inline-flex; gap: 6px; align-items: center; }
-        .card { background: #1c2126; border: 1px solid #2a3138; border-radius: 10px; padding: 10px 12px; margin: 6px 0; }
-        .card.selected { border-color: #2d6cdf; }
-        a.unread { color: #ffd27a; }
-        a.unread::after { content: ' ●'; color: #e0a93d; }
-        .spread { justify-content: space-between; }
+        /* Standalone-only bits that aren't in the shared app stylesheet. */
+        header { padding: 12px 0 2px; }
+        header h1 { margin: 0; }
         a { color: #7fb4ff; }
-        footer { margin-top: 28px; }
+        /* Cap the render height on every width so it never outgrows the window; app.css handles
+           the wide two-column breakout and its own height cap above 1200px. */
+        #canvas { width: 100%; aspect-ratio: 4/3; max-width: calc(76vh * 4 / 3); margin-inline: auto;
+                  border-radius: 10px; background: #101315; touch-action: none; display: block; }
+        /* Narrow screens: centre the single column. The app caps this via its .content wrapper;
+           the standalone has no .content, so give studio-inner a max width below the breakout. */
+        @media (max-width: 1199px) { .studio-inner { max-width: 1080px; margin: 0 auto; padding: 0 16px; } }
+        /* The JS marks active toggles with .active and the selected light with .selected; the app
+           Razor uses .primary / .selected-part, so bridge those two class names to the app styles. */
+        button.active { background: #2d6cdf; border-color: #2d6cdf; color: #fff; }
+        .card.selected { border-color: #2d6cdf; }
+        /* Drop zone + unread-news badge (standalone-only). */
+        #drop { border: 2px dashed #2d6cdf; border-radius: 10px; padding: 30px 16px; text-align: center;
+                margin: 0 0 12px; cursor: pointer; }
+        #drop.hover { background: #1a2436; }
+        a.unread { color: #ffd27a; } a.unread::after { content: ' ●'; color: #e0a93d; }
+        footer { margin-top: 24px; }
     </style>
 </head>
 <body>
+<div class="studio-layout">
+<div class="studio-inner">
+
 <header>
     <h1>Chromatory — Light Studio</h1>
     <p class="muted small">Plan light placement for NMM and OSL: load the STL you print from, place
@@ -66,15 +57,16 @@
         · <a href="assembly/" id="assemblyLink" style="display:none">🧩 Assembly workbench</a>
         · <a href="news.html" id="newsLink">🔔 News</a> · <a href="terms.html">Terms</a></p>
 </header>
-<main>
-    <div id="stage">
+
+<div class="studio-grid">
+<div class="studio-stage">
     <div id="drop">
         <b>Drop an STL here</b> or <a href="#" id="pick">choose a file</a>
         <div class="muted small" id="loadstatus">binary or ASCII STL · stays on your device</div>
         <input type="file" id="file" accept=".stl" style="display:none" />
     </div>
 
-    <canvas id="canvas"></canvas>
+    <canvas id="canvas" class="studio-canvas"></canvas>
     <div class="row">
         <button class="ghost" id="lockSpec"
             title="Freeze the highlights as seen from THIS view — orbit freely, they stay put (that's where you'll paint them). Click again to unfreeze.">🔒 Lock highlights</button>
@@ -88,10 +80,12 @@
         <button class="ghost" data-orient="z,-1" title="Roll right">⟳</button>
         <button class="ghost" id="orientReset" title="Back to how it loaded">Reset</button>
     </div>
-    </div><!-- /stage -->
+</div><!-- /studio-stage -->
 
-    <div id="panel">
-    <h2>Look</h2>
+<div class="studio-panel">
+
+<details class="card section" open>
+    <summary>🎨 Look</summary>
     <div class="muted small">Responds to your lights:</div>
     <div class="row" id="looks-live"></div>
     <div class="muted small">Fixed idealized reference (ignores lights — the shapes to copy):</div>
@@ -104,8 +98,10 @@
         <label>Metal <input type="range" id="metal" min="0" max="1" step="0.05" value="1" /></label>
         <label>Rough <input type="range" id="rough" min="0.02" max="1" step="0.02" value="0.3" /></label>
     </div>
+</details>
 
-    <h2>Lights</h2>
+<details class="card section" open>
+    <summary>💡 Lights</summary>
     <div class="row">
         <button data-preset="zenithal">Zenithal</button>
         <button data-preset="keyrim">Key + rim</button>
@@ -135,77 +131,94 @@
         <span class="muted small">painters shade toward a colour, not black — try a cool blue-violet</span>
     </div>
     <div id="lights"></div>
+</details>
 
-    <div id="regionsSection" style="display:none">
-        <h2>Regions</h2>
-        <div class="muted small">Paint areas on the model (armour, cloth, skin…), then light one up on the render.</div>
-        <div class="row">
-            <button class="ghost" id="paintToggle"
-                title="Drag on the model to paint the selected area; right-drag erases; orbit on empty space">🎨 Paint regions</button>
-            <span id="paintTools" style="display:none">
-                <button id="brushTool" class="active" title="Drag to paint with a round brush">🖌 Brush</button>
-                <button id="fillTool" class="ghost"
-                    title="Click an area to fill it — spreads until the surface bends past the angle (right-click fills with the eraser)">🪄 Fill</button>
-                <label id="brushSizeRow">Brush <input type="range" id="brushSize" min="0.005" max="0.3" step="0.005" value="0.10"
-                    title="Drag left for a fine detail brush — zoom in to clean up region edges"></label>
-                <label id="fillAngleRow" style="display:none">Angle <input type="range" id="fillAngle" min="5" max="60" step="1" value="30"><span id="fillAngleVal">30</span>°</label>
-                <button class="ghost" id="clearRegions" title="Erase every painted region">Clear</button>
-            </span>
-            <span class="muted small" id="regionStatus"></span>
-        </div>
-        <div class="row" id="paletteRow" style="display:none"></div>
-        <details id="paletteEdit" style="display:none;margin-top:4px">
-            <summary class="muted small">Rename / recolour areas</summary>
-            <div id="paletteEditList" style="display:flex;flex-direction:column;gap:4px;margin-top:6px"></div>
-            <button class="ghost" id="addRegion" style="margin-top:6px">+ Add area</button>
-        </details>
-        <div class="row" id="lightUpRow" style="display:none"></div>
-        <div class="row">
-            <button id="saveRegions">💾 Save areas…</button>
-            <button id="loadRegions">📂 Load areas</button>
-            <input type="file" id="regionsFile" accept=".json" style="display:none" />
-        </div>
-    </div><!-- /regionsSection -->
-
-    <div id="sceneSection" style="display:none">
-        <h2>Scene</h2>
-        <div class="muted small">Add more STLs to light a composed scene (a base, scenery, a second
-            mini). Click one to select it, then drag its gizmo to move or turn it. Scene models are
-            session-only — save a render to keep the composition.</div>
-        <div class="row">
-            <button id="addProp">📂 Add STL</button>
-            <input type="file" id="propFile" accept=".stl" multiple style="display:none" />
-            <span id="propModeButtons" style="display:none">
-                <button id="propMove" class="active" title="Drag to move the selected model">↔ Move</button>
-                <button id="propRotate" class="ghost" title="Drag to turn the selected model">⟳ Rotate</button>
-            </span>
-        </div>
-        <div class="row" id="props"></div>
+<details class="card section" id="regionsSection">
+    <summary>🖌 Regions</summary>
+    <div class="muted small">Paint areas on the model (armour, cloth, skin…), then light one up on the render.</div>
+    <div class="row">
+        <button class="ghost" id="paintToggle"
+            title="Drag on the model to paint the selected area; right-drag erases; orbit on empty space">🎨 Paint regions</button>
+        <span id="paintTools" style="display:none">
+            <button id="brushTool" class="active" title="Drag to paint with a round brush">🖌 Brush</button>
+            <button id="fillTool" class="ghost"
+                title="Click an area to fill it — spreads until the surface bends past the angle (right-click fills with the eraser)">🪄 Fill</button>
+            <label id="brushSizeRow">Brush <input type="range" id="brushSize" min="0.005" max="0.3" step="0.005" value="0.10"
+                title="Drag left for a fine detail brush — zoom in to clean up region edges"></label>
+            <label id="fillAngleRow" style="display:none">Angle <input type="range" id="fillAngle" min="5" max="60" step="1" value="30"><span id="fillAngleVal">30</span>°</label>
+            <button class="ghost" id="clearRegions" title="Erase every painted region">Clear</button>
+        </span>
+        <span class="muted small" id="regionStatus"></span>
     </div>
+    <div class="row" id="paletteRow" style="display:none"></div>
+    <details id="paletteEdit" style="display:none;margin-top:4px">
+        <summary class="muted small">Rename / recolour areas</summary>
+        <div id="paletteEditList" style="display:flex;flex-direction:column;gap:4px;margin-top:6px"></div>
+        <button class="ghost" id="addRegion" style="margin-top:6px">+ Add area</button>
+    </details>
+    <div class="row" id="lightUpRow" style="display:none"></div>
+    <div class="row">
+        <button id="saveRegions">💾 Save areas…</button>
+        <button id="loadRegions">📂 Load areas</button>
+        <input type="file" id="regionsFile" accept=".json" style="display:none" />
+    </div>
+</details>
 
-    <h2>Rigs &amp; capture</h2>
+<details class="card section">
+    <summary>💾 Rigs</summary>
+    <div class="muted small">A rig saves everything: lights, look, colour, ambient, floor, shadows — as a JSON file you can reload here or in the app.</div>
     <div class="row">
         <button id="saveRig">💾 Save rig…</button>
         <button id="loadRig">📂 Load rig</button>
         <input type="file" id="rigFile" accept=".json" style="display:none" />
+    </div>
+</details>
+
+<details class="card section" open>
+    <summary>📸 Capture</summary>
+    <div class="muted small">Save the current render as a PNG — your painting reference.</div>
+    <div class="row">
         <button class="primary" id="shot">📸 Save render (PNG)</button>
     </div>
-    </div><!-- /panel -->
+</details>
 
-    <footer class="muted small">
-        Part of <b>Chromatory</b>, the local-first assistant for miniature painters.
-        Free to use; your files stay on your device.<br />
-        Sample model: <a href="https://commons.wikimedia.org/wiki/File:Bust_of_Emperor_Caracalla.stl"
-        target="_blank" rel="noopener">Bust of Emperor Caracalla</a> — CC0 3D scan via Wikimedia Commons.
-    </footer>
-</main>
+<details class="card section" id="sceneSection">
+    <summary>🧩 Scene</summary>
+    <div class="muted small">Add more STLs to light a composed scene (a base, scenery, a second
+        mini). Click one to select it, then drag its gizmo to move or turn it. Scene models are
+        session-only — save a render to keep the composition.</div>
+    <div class="row">
+        <button id="addProp">📂 Add STL</button>
+        <input type="file" id="propFile" accept=".stl" multiple style="display:none" />
+        <span id="propModeButtons" style="display:none">
+            <button id="propMove" class="active" title="Drag to move the selected model">↔ Move</button>
+            <button id="propRotate" class="ghost" title="Drag to turn the selected model">⟳ Rotate</button>
+        </span>
+    </div>
+    <div class="row" id="props"></div>
+</details>
+
+</div><!-- /studio-panel -->
+</div><!-- /studio-grid -->
+
+<footer class="muted small">
+    Part of <b>Chromatory</b>, the local-first assistant for miniature painters.
+    Free to use; your files stay on your device.<br />
+    Sample model: <a href="https://commons.wikimedia.org/wiki/File:Bust_of_Emperor_Caracalla.stl"
+    target="_blank" rel="noopener">Bust of Emperor Caracalla</a> — CC0 3D scan via Wikimedia Commons.
+</footer>
+
+</div><!-- /studio-inner -->
+</div><!-- /studio-layout -->
 
 <script type="module">
     import * as studio from './js/lightstudio.js';
 
-    // Release feature flags for the STANDALONE build — edited per release, applied at load.
+    // Compile-time feature flags. The deploy script (Publish-StandaloneStudio.ps1) REWRITES this
+    // line per release tier, so options are gated at build time from one page — never a separate
+    // hand-maintained reduced variant. This literal is the Dev default (everything on).
     // regions: paint areas on the model (armour, cloth, skin…), then glow one on the render.
-    // assembly: links the Assembly workbench (published under /assembly/ by the deploy script).
+    // assembly: links the Assembly workbench (Pro/Dev; published under /assembly/ by the script).
     // multiStl: the Scene section — add extra STLs as movable props to light a composed scene.
     const FEATURES = { regions: true, assembly: true, multiStl: true };
 
