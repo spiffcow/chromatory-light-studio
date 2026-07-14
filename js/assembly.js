@@ -124,24 +124,34 @@ export function init(canvas) {
     // One COMBINED control: translate arrows and rotate rings live together (two instances on
     // the same pivot), so there is no mode to switch.
     scene.add(pivot);
-    const onGizmoDrag = event => {
-        controls.enabled = !event.value;
-        if (event.value) captureUndo('gizmo', false);
-        else { syncPivot(); afterPartMoved(); }
-    };
     moveGizmo = new TransformControls(camera, canvas);
     moveGizmo.setMode('translate');
     moveGizmo.setSize(0.75);
-    moveGizmo.addEventListener('dragging-changed', onGizmoDrag);
     moveGizmo.addEventListener('objectChange', applyPivotChange);
     scene.add(moveGizmo);
 
     rotateGizmo = new TransformControls(camera, canvas);
     rotateGizmo.setMode('rotate');
     rotateGizmo.setSize(1.15);
-    rotateGizmo.addEventListener('dragging-changed', onGizmoDrag);
     rotateGizmo.addEventListener('objectChange', applyPivotChange);
     scene.add(rotateGizmo);
+
+    // A drag must be ONE action — move or rotate, never both. The two gizmos' pick regions
+    // overlap (the translate centre handles sit inside the rotate gizmo's free-rotate sphere),
+    // and TransformControls re-computes its hovered handle INSIDE its own pointerdown, so gating
+    // on the hover state at press time missed any press that arrived without a fresh hover
+    // (touch, fast clicks) — BOTH gizmos started dragging and the part moved and rotated at
+    // once. Instead: the instant one gizmo starts dragging, the other is disabled for the rest
+    // of the gesture (its pointerdown handler then ignores it entirely). The gizmos see the
+    // pointerdown in registration order, so translate — created first — wins where they overlap.
+    const onGizmoDrag = other => event => {
+        controls.enabled = !event.value;
+        other.enabled = !event.value;
+        if (event.value) captureUndo('gizmo', false);
+        else { syncPivot(); afterPartMoved(); }
+    };
+    moveGizmo.addEventListener('dragging-changed', onGizmoDrag(rotateGizmo));
+    rotateGizmo.addEventListener('dragging-changed', onGizmoDrag(moveGizmo));
 
     resize();
     window.addEventListener('resize', resize);
@@ -150,19 +160,10 @@ export function init(canvas) {
     canvas.addEventListener('pointermove', onPointerMove);
     canvas.addEventListener('pointerup', onPointerUp);
 
-    // The move (translate) and rotate gizmos share one pivot and their pick regions OVERLAP near the
-    // centre, so grabbing a translate arrow/handle could also catch a rotate ring — and the part would
-    // rotate instead of move. Gate on press (capture phase, before the gizmos' own handlers): enable
-    // only the gizmo whose handle is actually under the cursor, translate winning ties; restore both
-    // on release. `enabled=false` makes TransformControls ignore the gesture entirely.
-    const gizmoGate = () => {
-        if (moveGizmo.axis) rotateGizmo.enabled = false;
-        else if (rotateGizmo.axis) moveGizmo.enabled = false;
-    };
-    const gizmoUngate = () => { moveGizmo.enabled = true; rotateGizmo.enabled = true; };
-    canvas.addEventListener('pointerdown', gizmoGate, true);
-    canvas.addEventListener('pointerup', gizmoUngate, true);
-    canvas.addEventListener('pointercancel', gizmoUngate, true);
+    // Safety: a cancelled gesture (browser stole the pointer) never fires the gizmos' own
+    // pointerup, so re-enable both here or one could stay locked out.
+    const gizmoReset = () => { moveGizmo.enabled = true; rotateGizmo.enabled = true; };
+    canvas.addEventListener('pointercancel', gizmoReset, true);
 
     renderer.setAnimationLoop(() => {
         controls.update();

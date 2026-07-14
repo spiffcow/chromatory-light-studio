@@ -46,9 +46,11 @@ export function getShadows() {
 /// Marks a primary light as an occluded caster (bounce/mirror lights stay unoccluded fakes).
 /// Point lights get 512px cube faces: a point shadow is SIX full-scene renders, and cube maps
 /// at 1024 stack into WebGL context loss once a rig holds several casters on an 8 GB card.
-function configureShadowCaster(light) {
+/// `mapSizeOverride` lets secondary casters (cluster members, far tints) take smaller maps so a
+/// composite emitter's total VRAM matches a single plain caster.
+function configureShadowCaster(light, mapSizeOverride = null) {
     light.castShadow = true;
-    const mapSize = light.isPointLight ? 512 : 1024;
+    const mapSize = mapSizeOverride ?? (light.isPointLight ? 512 : 1024);
     light.shadow.mapSize.set(mapSize, mapSize);
     light.shadow.bias = -0.0015;
     light.shadow.normalBias = 1.0; // dense print meshes shadow-acne badly without this
@@ -65,6 +67,10 @@ function configureShadowCaster(light) {
         light.shadow.camera.near = 2;
         light.shadow.camera.far = 800;
     }
+    // Assigning frustum fields does NOT rebuild the camera's projection matrix — without this the
+    // shadow pass kept rendering through the DEFAULT frustum (directional: a ±5-unit ortho box on
+    // an 80-unit model), so casters existed but occlusion never landed anywhere visible.
+    light.shadow.camera.updateProjectionMatrix();
 }
 
 // The table the mini stands on: its color paints the visible ground plane AND tints every
@@ -886,24 +892,24 @@ const CLUSTER_OFFSETS = [
     new THREE.Vector3(-1, 1, -1), new THREE.Vector3(-1, -1, 1)
 ].map(v => v.normalize());
 
-function makePointEmitter(objects, color, candela, decay, size, castShadows = true) {
+function makePointEmitter(objects, color, candela, decay, size, castShadows = true, mapSize = 512) {
     if (size <= 0) {
         const light = new THREE.PointLight(color, candela, 0, decay);
-        if (castShadows) configureShadowCaster(light);
+        if (castShadows) configureShadowCaster(light, mapSize);
         objects.push(light);
         return;
     }
-    // ONE shadow caster per emitter, not four: every point caster is a six-render cube map,
-    // and two "large" lights used to mean 8-16 of them — reliable context loss on 8 GB GPUs.
-    // Softness now comes from the caster's PCF radius scaling with the source size.
-    let needsCaster = castShadows;
+    // EVERY cluster member casts, at quarter map size — 4×256² cube faces cost the same VRAM as
+    // the single 512² caster used before, so the 8 GB context-loss ceiling is unchanged. One
+    // caster out of four had let 75% of the emitter shine straight through walls (measured: a
+    // size-12 light kept 3% of a plain light's occlusion — "line of sight doesn't cast shadows").
+    // Four overlapping maps also make the penumbra REAL, so the PCF radius stays small.
     for (const offset of CLUSTER_OFFSETS) {
         const light = new THREE.PointLight(color, candela / CLUSTER_OFFSETS.length, 0, decay);
         light.userData.clusterOffset = offset.clone().multiplyScalar(size);
-        if (needsCaster) {
-            configureShadowCaster(light);
-            light.shadow.radius = 2 + size * 0.4;
-            needsCaster = false;
+        if (castShadows) {
+            configureShadowCaster(light, Math.min(mapSize, 256));
+            light.shadow.radius = 2 + size * 0.15;
         }
         objects.push(light);
     }
@@ -927,10 +933,12 @@ function buildLightObjects(entry) {
         const t = clampGradientStart(entry.gradientStart);
         const x = t * POINT_REFERENCE_DISTANCE;
         const A = entry.uiIntensity / (Math.pow(t, dNear) + Math.pow(t, dFar));
-        // The near emitter casts the shadow; the far tint shares its position, so a second
-        // cube map would buy nothing but VRAM pressure.
+        // BOTH halves cast. The far tint used to skip its cube map ("shares the near light's
+        // position, a second map buys nothing") — but a non-casting light is UNOCCLUDED, so the
+        // far colour poured straight through walls (measured: a gradient light kept 16% of a
+        // plain light's occlusion). Its map rides at 256² to keep the VRAM budget modest.
         makePointEmitter(objects, new THREE.Color(entry.color), A * Math.pow(x, dNear), dNear, entry.size, true);
-        makePointEmitter(objects, new THREE.Color(entry.farColor), A * Math.pow(x, dFar), dFar, entry.size, false);
+        makePointEmitter(objects, new THREE.Color(entry.farColor), A * Math.pow(x, dFar), dFar, entry.size, true, 256);
     }
     else {
         makePointEmitter(objects, new THREE.Color(entry.color),
@@ -983,8 +991,7 @@ function mountLights(entry) {
         scene.add(light);
         if (light.target) scene.add(light.target);
     }
-    syncLightPositions(entry);
-    requestShadowUpdate();
+    syncLightPositions(entry); // requests the shadow re-render itself
 }
 
 function unmountLights(entry) {
@@ -1505,7 +1512,12 @@ function surfFor(idx) {
     const m = slot ? REGION_MATERIALS[slot.material] : undefined;
     // w: 0 = unpainted, 0.6 = tinted, 1.0 = tinted + EMISSIVE (the region powers a glow light).
     const w = glowingSlots.has(idx) ? 1.0 : 0.6;
-    return m ? [1, m.metalness, m.roughness, w] : [0, 0, 0, w];
+    if (!m) return [0, 0, 0, w];
+    // Per-slot fine-tune: an explicit metalness/roughness on the slot overrides the preset's
+    // values (the presets become starting points). Rides in the palette, so it saves with the mask.
+    const metal = Math.min(1, Math.max(0, slot.metalness ?? m.metalness));
+    const rough = Math.min(1, Math.max(0, slot.roughness ?? m.roughness));
+    return [1, metal, rough, w];
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1970,7 +1982,7 @@ export function getPaintMode() { return paintMode; }
 
 export function setBrush(opts) {
     if (opts.region !== undefined) brush.region = opts.region | 0;
-    if (opts.radius !== undefined) brush.radius = Math.max(0.02, Math.min(0.4, opts.radius));
+    if (opts.radius !== undefined) brush.radius = Math.max(0.005, Math.min(0.4, opts.radius)); // floor low enough for edge cleanup
     if (opts.mode !== undefined) brush.mode = opts.mode === 'fill' ? 'fill' : 'brush';
     if (opts.fillAngle !== undefined) {
         brush.fillAngle = Math.max(1, Math.min(90, opts.fillAngle));
@@ -2295,6 +2307,31 @@ export function getAppearanceJson() {
 }
 
 /// How many lights are rendering shadow maps right now (diagnostics; point casters cost 6x).
+/// Dev/tuning: live shadow-system state, and a lever to force per-frame shadow updates.
+export function __debugShadowState() {
+    const casters = [];
+    scene.traverse(o => {
+        if (o.isLight && o.castShadow) casters.push({
+            type: o.type, pos: o.position.toArray().map(v => +v.toFixed(1)),
+            near: o.shadow.camera.near, far: o.shadow.camera.far,
+            mapNull: !o.shadow.map, visible: o.visible, intensity: +o.intensity.toFixed(1)
+        });
+    });
+    return JSON.stringify({
+        casters,
+        shadowMap: { enabled: renderer.shadowMap.enabled, autoUpdate: renderer.shadowMap.autoUpdate,
+                     needsUpdate: renderer.shadowMap.needsUpdate, type: renderer.shadowMap.type },
+        mesh: mesh ? { cast: mesh.castShadow, receive: mesh.receiveShadow, mat: mesh.material.type,
+                       visible: mesh.visible } : null,
+        ground: ground ? { receive: ground.receiveShadow } : null
+    });
+}
+
+export function __debugShadowAuto(on) {
+    renderer.shadowMap.autoUpdate = !!on;
+    renderer.shadowMap.needsUpdate = true;
+}
+
 export function getShadowCasterCount() {
     let count = 0;
     for (const entry of lights.values())
