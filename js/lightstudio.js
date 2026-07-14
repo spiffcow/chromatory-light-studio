@@ -47,8 +47,10 @@ export function getShadows() {
 /// Point lights get 512px cube faces: a point shadow is SIX full-scene renders, and cube maps
 /// at 1024 stack into WebGL context loss once a rig holds several casters on an 8 GB card.
 /// `mapSizeOverride` lets secondary casters (cluster members, far tints) take smaller maps so a
-/// composite emitter's total VRAM matches a single plain caster.
-function configureShadowCaster(light, mapSizeOverride = null) {
+/// composite emitter's total VRAM matches a single plain caster. `nearOverride` lets sized
+/// emitters skip occluders inside their own source volume (an orb held IN a hand must light the
+/// scene from its surface, not be swallowed by the palm around its centre).
+function configureShadowCaster(light, mapSizeOverride = null, nearOverride = null) {
     light.castShadow = true;
     const mapSize = mapSizeOverride ?? (light.isPointLight ? 512 : 1024);
     light.shadow.mapSize.set(mapSize, mapSize);
@@ -64,13 +66,36 @@ function configureShadowCaster(light, mapSizeOverride = null) {
         light.shadow.camera.far = 800;
     }
     else {
-        light.shadow.camera.near = 2;
+        light.shadow.camera.near = nearOverride ?? 2;
         light.shadow.camera.far = 800;
     }
     // Assigning frustum fields does NOT rebuild the camera's projection matrix — without this the
     // shadow pass kept rendering through the DEFAULT frustum (directional: a ±5-unit ortho box on
     // an 80-unit model), so casters existed but occlusion never landed anywhere visible.
     light.shadow.camera.updateProjectionMatrix();
+}
+
+// Point-shadow BUDGET. Every cube shadow map is one fragment texture unit, and the lit material
+// itself uses several — a rig of sized/gradient lights whose sub-lights ALL cast blew past
+// MAX_TEXTURE_IMAGE_UNITS(16): the program failed validation and the model rendered black.
+// Candidates carry userData.shadowRank (0 = an emitter's primary caster, 1 = far tints,
+// 3+ = extra cluster members); after any light change the budget keeps the best six and demotes
+// the rest, so quality degrades gracefully instead of the shader dying.
+const MAX_POINT_CASTERS = 6;
+
+function enforceShadowBudget() {
+    const candidates = [];
+    for (const entry of lights.values())
+        for (const light of entry.lights ?? [])
+            if (light.isPointLight && light.userData.shadowRank !== undefined) candidates.push(light);
+    candidates.sort((a, b) => a.userData.shadowRank - b.userData.shadowRank);
+    candidates.forEach((light, i) => {
+        const cast = i < MAX_POINT_CASTERS;
+        if (light.castShadow !== cast) {
+            light.castShadow = cast;
+            if (!cast && light.shadow?.map) { light.shadow.map.dispose(); light.shadow.map = null; }
+        }
+    });
 }
 
 // The table the mini stands on: its color paints the visible ground plane AND tints every
@@ -892,24 +917,28 @@ const CLUSTER_OFFSETS = [
     new THREE.Vector3(-1, 1, -1), new THREE.Vector3(-1, -1, 1)
 ].map(v => v.normalize());
 
-function makePointEmitter(objects, color, candela, decay, size, castShadows = true, mapSize = 512) {
+function makePointEmitter(objects, color, candela, decay, size, castShadows = true, mapSize = 512, rankBase = 0) {
     if (size <= 0) {
         const light = new THREE.PointLight(color, candela, 0, decay);
-        if (castShadows) configureShadowCaster(light, mapSize);
+        if (castShadows) { configureShadowCaster(light, mapSize); light.userData.shadowRank = rankBase; }
         objects.push(light);
         return;
     }
     // EVERY cluster member casts, at quarter map size — 4×256² cube faces cost the same VRAM as
-    // the single 512² caster used before, so the 8 GB context-loss ceiling is unchanged. One
-    // caster out of four had let 75% of the emitter shine straight through walls (measured: a
-    // size-12 light kept 3% of a plain light's occlusion — "line of sight doesn't cast shadows").
-    // Four overlapping maps also make the penumbra REAL, so the PCF radius stays small.
-    for (const offset of CLUSTER_OFFSETS) {
+    // the single 512² caster used before. One caster out of four had let 75% of the emitter
+    // shine straight through walls (measured: a size-12 light kept 3% of a plain light's
+    // occlusion — "line of sight doesn't cast shadows"). Four overlapping maps also make the
+    // penumbra REAL. The global caster budget (enforceShadowBudget) demotes extras when a rig
+    // holds several such emitters. The near plane sits just past the source volume: an emitter
+    // with physical SIZE lights the scene from its surface, so geometry inside the orb (the hand
+    // holding it) must not swallow the light.
+    for (const [i, offset] of CLUSTER_OFFSETS.entries()) {
         const light = new THREE.PointLight(color, candela / CLUSTER_OFFSETS.length, 0, decay);
         light.userData.clusterOffset = offset.clone().multiplyScalar(size);
         if (castShadows) {
-            configureShadowCaster(light, Math.min(mapSize, 256));
+            configureShadowCaster(light, Math.min(mapSize, 256), Math.max(2, size * 1.2));
             light.shadow.radius = 2 + size * 0.15;
+            light.userData.shadowRank = i === 0 ? rankBase : rankBase + 3;
         }
         objects.push(light);
     }
@@ -936,9 +965,9 @@ function buildLightObjects(entry) {
         // BOTH halves cast. The far tint used to skip its cube map ("shares the near light's
         // position, a second map buys nothing") — but a non-casting light is UNOCCLUDED, so the
         // far colour poured straight through walls (measured: a gradient light kept 16% of a
-        // plain light's occlusion). Its map rides at 256² to keep the VRAM budget modest.
+        // plain light's occlusion). Its map rides at 256² and yields first under the caster budget.
         makePointEmitter(objects, new THREE.Color(entry.color), A * Math.pow(x, dNear), dNear, entry.size, true);
-        makePointEmitter(objects, new THREE.Color(entry.farColor), A * Math.pow(x, dFar), dFar, entry.size, true, 256);
+        makePointEmitter(objects, new THREE.Color(entry.farColor), A * Math.pow(x, dFar), dFar, entry.size, true, 256, 1);
     }
     else {
         makePointEmitter(objects, new THREE.Color(entry.color),
@@ -991,6 +1020,7 @@ function mountLights(entry) {
         scene.add(light);
         if (light.target) scene.add(light.target);
     }
+    enforceShadowBudget(); // a new emitter may push the rig past the texture-unit budget
     syncLightPositions(entry); // requests the shadow re-render itself
 }
 
@@ -1004,6 +1034,7 @@ function unmountLights(entry) {
         light.shadow?.dispose?.();
     }
     entry.lights = [];
+    enforceShadowBudget(); // freed budget re-promotes the best demoted casters
 }
 
 export function addLight(type, options) {
@@ -1035,10 +1066,10 @@ export function addLight(type, options) {
     };
     entry.gizmo.scale.setScalar(1 + entry.size / 8); // the handle hints at the source size
     if (entry.regionSource !== null && options?.x === undefined) anchorRegionLight(entry);
+    lights.set(id, entry); // register FIRST: mountLights budgets casters across the whole map
     if (entry.enabled) mountLights(entry);
     else entry.lights = [];
     applyLightOrbLook(entry);
-    lights.set(id, entry);
     syncGlowingSlots();
     return id;
 }
