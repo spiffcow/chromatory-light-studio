@@ -27,17 +27,20 @@
     <p class="muted small"><a href="./">← Light Studio</a> · <a href="terms.html">Terms &amp; Conditions</a></p>
 </header>
 <main>
-    <div class="card note">
-        <h2>A note from the developer — July 10, 2026</h2>
-        <p>Hi all! I hope you're enjoying the product. I know most of you found this through
-        r/miniaturepainting and might be wondering why I haven't responded to your messages. In short,
-        one of the moderators on another painting subreddit objected to my work, permabanned me, and
-        somehow convinced Reddit to temporarily suspend my account. I don't want to get into the
-        details, but if you read the new <a href="terms.html">terms and conditions</a> you can
-        probably piece things together.</p>
-        <p>Anyway, I'm planning lots of exciting new features in the coming days and weeks. I also
-        want to give a special shoutout to u/ben8192 for his recommendations on locking specular
-        highlights and setting shadow colors.</p>
+    <div class="card">
+        <h2>Release notes — July 14, 2026</h2>
+        <ul class="small">
+            <li><b>🖌 Paint regions.</b> Mark out areas on the model — armour, cloth, skin — and give
+                each its own colour and finish (matte, satin, gloss or metal). Paint with a brush or
+                click-to-fill, down to a fine detail size for clean edges. Highlight one area at a
+                time to focus on it, and save or load your painting as a file.</li>
+            <li><b>Shadows that actually block light.</b> Line-of-sight is now properly occluded — a
+                lantern behind the model no longer lights the front, and large / soft light sources
+                cast solid shadows too (they used to leak straight through).</li>
+            <li><b>Redesigned controls.</b> The panel is now organised into collapsible sections —
+                Look, Lights, Regions, Rigs, Capture and Scene — matching the full Chromatory app, so
+                the two feel the same.</li>
+        </ul>
     </div>
 
     <div class="card">
@@ -78,7 +81,7 @@
 </main>
 <script>
     // Seeing this page clears the "unread" badge on the studio pages.
-    localStorage.setItem('pb-news-seen', '2026-07-13');
+    localStorage.setItem('pb-news-seen', '2026-07-14');
 </script>
 </body>
 </html>
