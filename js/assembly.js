@@ -764,11 +764,100 @@ export async function snapSelected(auto = false) {
 // Export
 // ---------------------------------------------------------------------------------------------
 
-/// Exact byte size the merged export will have (84-byte header + 50 per triangle).
+/// Exact byte size the merged export will have (84-byte header + 50 per triangle). Stitching only
+/// MOVES seam vertices — it never adds or removes triangles — so the size is the same either way.
 export function exportStlSize() {
     let totalTris = 0;
     for (const entry of parts.values()) if (entry.mesh.visible) totalTris += entry.triangles;
     return 84 + totalTris * 50;
+}
+
+const STITCH_SAMPLES = 90000; // denser than the ICP target: the gap fit wants finer surface detail
+
+/// World-space surface samples (points + normals) for a part, reusing the ICP sampler.
+function worldSamples(entry, count) {
+    entry.mesh.updateMatrixWorld();
+    const local = getSamples(entry, count);
+    const m = entry.mesh.matrixWorld;
+    const nm = new THREE.Matrix3().getNormalMatrix(m);
+    const points = new Float32Array(local.count * 3);
+    const normals = new Float32Array(local.count * 3);
+    const v = new THREE.Vector3(), n = new THREE.Vector3();
+    for (let i = 0; i < local.count; i++) {
+        v.set(local.points[i * 3], local.points[i * 3 + 1], local.points[i * 3 + 2]).applyMatrix4(m);
+        n.set(local.normals[i * 3], local.normals[i * 3 + 1], local.normals[i * 3 + 2]).applyMatrix3(nm).normalize();
+        points[i * 3] = v.x; points[i * 3 + 1] = v.y; points[i * 3 + 2] = v.z;
+        normals[i * 3] = n.x; normals[i * 3 + 1] = n.y; normals[i * 3 + 2] = n.z;
+    }
+    return { points, normals, count: local.count, area: local.area };
+}
+
+/// Gap-stitcher: closes the intentional clearance between mating parts so the merged STL prints as
+/// one solid instead of two pieces with a slicer-visible seam. A vertex is moved ONLY when it sits
+/// within `tol` of another part's surface AND that surface FACES it (opposing normals) — i.e. it's
+/// across a real slot-together gap, not just near a neighbour. Such a vertex is pushed onto the far
+/// surface and a hair past it (overlap), so the slicer's per-layer union fuses the two. The
+/// displacement is a pure function of the world position (cached per point), so every triangle
+/// sharing that vertex moves identically — the mesh stays watertight, no cracks. Interior/outer
+/// vertices are far from any other part, so the model's real dimensions and detail are untouched.
+function buildStitcher(visible, tol) {
+    const overlap = tol * 0.5;
+    const hashes = visible.map(entry => {
+        const ws = worldSamples(entry, STITCH_SAMPLES);
+        const spacing = Math.sqrt(ws.area / ws.count);
+        return buildHash(ws, Math.max(tol, spacing * 2));
+    });
+    // Per part, the bounding box of every OTHER part (expanded by tol): a vertex outside it can't be
+    // near a seam, so it skips the (relatively costly) nearest-surface query entirely.
+    const boxes = visible.map(entry => {
+        entry.mesh.updateMatrixWorld();
+        return new THREE.Box3().setFromObject(entry.mesh);
+    });
+    const otherBox = visible.map((_, pi) => {
+        const box = new THREE.Box3();
+        for (let j = 0; j < visible.length; j++) if (j !== pi) box.union(boxes[j]);
+        return box.expandByScalar(tol);
+    });
+
+    const cache = new Map();
+    const QUANT = 1e-4;
+    const dir = new THREE.Vector3();
+
+    function compute(p, pi) {
+        let best = null;
+        let bestDist = tol;
+        for (let j = 0; j < hashes.length; j++) {
+            if (j === pi) continue;
+            const hit = hashes[j].nearest(p.x, p.y, p.z, tol);
+            if (!hit || hit.dist >= bestDist) continue;
+            const s = hashes[j].samples;
+            const sx = s.points[hit.index * 3], sy = s.points[hit.index * 3 + 1], sz = s.points[hit.index * 3 + 2];
+            const nx = s.normals[hit.index * 3], ny = s.normals[hit.index * 3 + 1], nz = s.normals[hit.index * 3 + 2];
+            // The other surface must face p: its outward normal points from S toward p.
+            dir.set(p.x - sx, p.y - sy, p.z - sz);
+            const len = dir.length() || 1e-9;
+            if ((nx * dir.x + ny * dir.y + nz * dir.z) / len > 0.25)
+                { best = { sx, sy, sz, dist: hit.dist }; bestDist = hit.dist; }
+        }
+        if (!best) return null;
+        dir.set(best.sx - p.x, best.sy - p.y, best.sz - p.z);
+        const len = dir.length() || 1e-9;
+        // Both facing seams move toward each other, so each travels HALF the closure — they meet
+        // near the middle of the gap and overlap by `overlap`, rather than each crossing the whole
+        // gap and interpenetrating twice as far.
+        const push = Math.min(best.dist + overlap, tol + overlap) / 2;
+        return dir.multiplyScalar(push / len).clone();
+    }
+
+    return {
+        displace(p, pi) {
+            if (!otherBox[pi].containsPoint(p)) return; // nowhere near a seam
+            const k = `${Math.round(p.x / QUANT)},${Math.round(p.y / QUANT)},${Math.round(p.z / QUANT)}`;
+            let d = cache.get(k);
+            if (d === undefined) { d = compute(p, pi); cache.set(k, d); }
+            if (d) p.add(d);
+        }
+    };
 }
 
 /// One binary STL of every visible part, transforms baked in. Written via a per-triangle
@@ -776,10 +865,15 @@ export function exportStlSize() {
 /// of triangles and the naive path blocked the main thread for the better part of a minute.
 /// (STL is little-endian; typed arrays are little-endian on every platform we run on. The
 /// 2-byte attribute field stays zero — ArrayBuffers are born zeroed.)
-export function exportStlBytes() {
+/// <param name="stitchTolMm">When > 0, close intentional slot-together gaps up to this many model
+/// units between mating parts, so the export prints as one solid (see <see cref="buildStitcher"/>).
+/// 0 keeps every part exactly where it sits.</param>
+export function exportStlBytes(stitchTolMm = 0) {
     const visible = [...parts.values()].filter(e => e.mesh.visible);
     let totalTris = 0;
     for (const entry of visible) totalTris += entry.triangles;
+
+    const stitch = stitchTolMm > 0 && visible.length > 1 ? buildStitcher(visible, stitchTolMm) : null;
 
     const buffer = new ArrayBuffer(84 + totalTris * 50);
     const out = new Uint8Array(buffer);
@@ -791,7 +885,8 @@ export function exportStlBytes() {
     const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
     const ab = new THREE.Vector3(), ac = new THREE.Vector3(), n = new THREE.Vector3();
     let offset = 84;
-    for (const entry of visible) {
+    for (let pi = 0; pi < visible.length; pi++) {
+        const entry = visible[pi];
         entry.mesh.updateMatrixWorld();
         const matrix = entry.mesh.matrixWorld;
         const pos = entry.mesh.geometry.attributes.position;
@@ -799,6 +894,7 @@ export function exportStlBytes() {
             a.fromBufferAttribute(pos, t * 3).applyMatrix4(matrix);
             b.fromBufferAttribute(pos, t * 3 + 1).applyMatrix4(matrix);
             c.fromBufferAttribute(pos, t * 3 + 2).applyMatrix4(matrix);
+            if (stitch) { stitch.displace(a, pi); stitch.displace(b, pi); stitch.displace(c, pi); }
             n.copy(ab.subVectors(b, a)).cross(ac.subVectors(c, a)).normalize();
             scratch[0] = n.x; scratch[1] = n.y; scratch[2] = n.z;
             scratch[3] = a.x; scratch[4] = a.y; scratch[5] = a.z;
@@ -813,10 +909,10 @@ export function exportStlBytes() {
 
 /// Uploads the merged STL (e.g. as a Chromatory project model) without the bytes ever passing
 /// through the .NET side — Blazor supplies the URL and auth header, fetch does the rest.
-export async function uploadMerged(url, headerName, headerValue, filename) {
-    status('building the merged STL…');
+export async function uploadMerged(url, headerName, headerValue, filename, stitchTolMm = 0) {
+    status(stitchTolMm > 0 ? 'stitching seams + building the merged STL…' : 'building the merged STL…');
     await new Promise(r => setTimeout(r, 15)); // let the status paint before the bake blocks
-    const bytes = exportStlBytes();
+    const bytes = exportStlBytes(stitchTolMm);
     status(`uploading ${(bytes.byteLength / 1048576).toFixed(0)} MB…`);
     try {
         const response = await fetch(url + (url.includes('?') ? '&' : '?') + 'name=' + encodeURIComponent(filename), {

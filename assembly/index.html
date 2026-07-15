@@ -87,6 +87,14 @@
 
     <h2>Save</h2>
     <div class="row">
+        <label title="Kits often leave a small clearance between parts so they slot together. Turn this on to close that gap on export — the mating surfaces are nudged to overlap so the print comes out as one solid piece instead of two with a seam.">
+            <input type="checkbox" id="stitch" /> Close joint gaps
+        </label>
+        <label class="muted small" id="stitchTolRow" style="display:none" title="Largest gap to close, in model units (usually mm). Set it a touch above the kit's designed clearance — bigger gaps than this are left alone.">
+            up to <input type="number" id="stitchTol" min="0.05" max="2" step="0.05" value="0.2" style="width:64px"> mm
+        </label>
+    </div>
+    <div class="row">
         <button class="primary" id="exportBtn">💾 Save merged STL…</button>
         <span class="muted small">hidden parts are left out — use 👁 to exclude alternates</span>
     </div>
@@ -202,8 +210,12 @@
         a.click();
         URL.revokeObjectURL(a.href);
     }
+    $('stitch').addEventListener('change', () => {
+        $('stitchTolRow').style.display = $('stitch').checked ? '' : 'none';
+    });
     $('exportBtn').addEventListener('click', () => {
-        const bytes = studio.exportStlBytes();
+        const tol = $('stitch').checked ? parseFloat($('stitchTol').value) || 0 : 0;
+        const bytes = studio.exportStlBytes(tol);
         saveBlob(new Blob([bytes], { type: 'model/stl' }), 'assembled.stl', 'STL model', 'model/stl', '.stl');
     });
 </script>
