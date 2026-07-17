@@ -764,8 +764,88 @@ export async function snapSelected(auto = false) {
 // Export
 // ---------------------------------------------------------------------------------------------
 
-/// Exact byte size the merged export will have (84-byte header + 50 per triangle). Stitching only
-/// MOVES seam vertices — it never adds or removes triangles — so the size is the same either way.
+/// Bridge mode: instead of nudging the mating surfaces (which distorts them), leave both parts
+/// exactly as sculpted and ADD new geometry that fills the enclosed gap. For every triangle that
+/// faces another part across the gap, a small closed prism is emitted spanning from just inside
+/// this part to just inside the other (its 3 corners projected onto the other surface). The union
+/// of those prisms is a solid collar filling the seam — the slicer prints one piece. Each gap is
+/// bridged once (only from the lower-indexed part) so the fill isn't built twice. Returns a flat
+/// Float32Array of world-space triangle corners (9 floats per triangle).
+function buildBridgeTriangles(visible, tol) {
+    const overlap = tol * 0.5;
+    const hashes = visible.map(entry => {
+        const ws = worldSamples(entry, STITCH_SAMPLES);
+        const spacing = Math.sqrt(ws.area / ws.count);
+        return buildHash(ws, Math.max(tol, spacing * 2));
+    });
+    const boxes = visible.map(entry => { entry.mesh.updateMatrixWorld(); return new THREE.Box3().setFromObject(entry.mesh); });
+    const otherBox = visible.map((_, pi) => {
+        const box = new THREE.Box3();
+        for (let j = 0; j < visible.length; j++) if (j !== pi) box.union(boxes[j]);
+        return box.expandByScalar(tol);
+    });
+
+    const out = [];
+    const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+    const ab = new THREE.Vector3(), ac = new THREE.Vector3(), fn = new THREE.Vector3(), g = new THREE.Vector3(), dir = new THREE.Vector3();
+    const top = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
+    const bot = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
+    const corners = [a, b, c];
+
+    function nearestOn(j, p, maxDist) {
+        const hit = hashes[j].nearest(p.x, p.y, p.z, maxDist);
+        if (!hit) return null;
+        const s = hashes[j].samples, i = hit.index;
+        return { x: s.points[i * 3], y: s.points[i * 3 + 1], z: s.points[i * 3 + 2],
+                 nx: s.normals[i * 3], ny: s.normals[i * 3 + 1], nz: s.normals[i * 3 + 2], dist: hit.dist };
+    }
+    const emit = (v0, v1, v2) => out.push(v0.x, v0.y, v0.z, v1.x, v1.y, v1.z, v2.x, v2.y, v2.z);
+
+    for (let pi = 0; pi < visible.length; pi++) {
+        const entry = visible[pi];
+        entry.mesh.updateMatrixWorld();
+        const M = entry.mesh.matrixWorld;
+        const pos = entry.mesh.geometry.attributes.position;
+        for (let t = 0; t < entry.triangles; t++) {
+            a.fromBufferAttribute(pos, t * 3).applyMatrix4(M);
+            b.fromBufferAttribute(pos, t * 3 + 1).applyMatrix4(M);
+            c.fromBufferAttribute(pos, t * 3 + 2).applyMatrix4(M);
+            g.set((a.x + b.x + c.x) / 3, (a.y + b.y + c.y) / 3, (a.z + b.z + c.z) / 3);
+            if (!otherBox[pi].containsPoint(g)) continue;
+
+            // The nearest OTHER part whose surface faces this triangle across a gap ≤ tol.
+            let jBest = -1, centre = null, bestDist = tol;
+            for (let j = 0; j < hashes.length; j++) {
+                if (j === pi) continue;
+                const s = nearestOn(j, g, tol);
+                if (!s || s.dist >= bestDist) continue;
+                dir.set(g.x - s.x, g.y - s.y, g.z - s.z);
+                const len = dir.length() || 1e-9;
+                if ((s.nx * dir.x + s.ny * dir.y + s.nz * dir.z) / len > 0.25) { jBest = j; centre = s; bestDist = s.dist; }
+            }
+            if (jBest < pi) continue; // each gap bridged once, from the lower-indexed part
+
+            fn.copy(ab.subVectors(b, a)).cross(ac.subVectors(c, a)).normalize(); // outward face normal
+            for (let k = 0; k < 3; k++) {
+                top[k].copy(corners[k]).addScaledVector(fn, -overlap); // embed slightly into THIS part
+                const s = nearestOn(jBest, corners[k], tol * 2) || centre; // project onto the other part
+                bot[k].set(s.x - s.nx * overlap, s.y - s.ny * overlap, s.z - s.nz * overlap); // embed into it
+            }
+            emit(top[0], top[1], top[2]);            // caps
+            emit(bot[2], bot[1], bot[0]);
+            for (let k = 0; k < 3; k++) {            // side walls
+                const n = (k + 1) % 3;
+                emit(top[k], top[n], bot[n]);
+                emit(top[k], bot[n], bot[k]);
+            }
+        }
+    }
+    return out;
+}
+
+/// Exact byte size the merged export will have (84-byte header + 50 per triangle). Nudge-stitching
+/// only MOVES seam vertices, so the size is unchanged; bridge mode ADDS triangles, so this is a
+/// lower bound there (the bridge collar is small next to the parts).
 export function exportStlSize() {
     let totalTris = 0;
     for (const entry of parts.values()) if (entry.mesh.visible) totalTris += entry.triangles;
@@ -866,14 +946,20 @@ function buildStitcher(visible, tol) {
 /// (STL is little-endian; typed arrays are little-endian on every platform we run on. The
 /// 2-byte attribute field stays zero — ArrayBuffers are born zeroed.)
 /// <param name="stitchTolMm">When > 0, close intentional slot-together gaps up to this many model
-/// units between mating parts, so the export prints as one solid (see <see cref="buildStitcher"/>).
-/// 0 keeps every part exactly where it sits.</param>
-export function exportStlBytes(stitchTolMm = 0) {
+/// units between mating parts, so the export prints as one solid. 0 keeps every part exactly where
+/// it sits.</param>
+/// <param name="mode">'nudge' moves the mating surfaces to overlap (see <see cref="buildStitcher"/>);
+/// 'bridge' leaves both parts untouched and adds filler geometry across the gap
+/// (see <see cref="buildBridgeTriangles"/>).</param>
+export function exportStlBytes(stitchTolMm = 0, mode = 'nudge') {
     const visible = [...parts.values()].filter(e => e.mesh.visible);
-    let totalTris = 0;
-    for (const entry of visible) totalTris += entry.triangles;
+    const active = stitchTolMm > 0 && visible.length > 1;
+    const stitch = active && mode === 'nudge' ? buildStitcher(visible, stitchTolMm) : null;
+    const bridge = active && mode === 'bridge' ? buildBridgeTriangles(visible, stitchTolMm) : null;
+    const bridgeTris = bridge ? bridge.length / 9 : 0;
 
-    const stitch = stitchTolMm > 0 && visible.length > 1 ? buildStitcher(visible, stitchTolMm) : null;
+    let totalTris = bridgeTris;
+    for (const entry of visible) totalTris += entry.triangles;
 
     const buffer = new ArrayBuffer(84 + totalTris * 50);
     const out = new Uint8Array(buffer);
@@ -885,6 +971,15 @@ export function exportStlBytes(stitchTolMm = 0) {
     const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
     const ab = new THREE.Vector3(), ac = new THREE.Vector3(), n = new THREE.Vector3();
     let offset = 84;
+    const writeTri = () => {
+        n.copy(ab.subVectors(b, a)).cross(ac.subVectors(c, a)).normalize();
+        scratch[0] = n.x; scratch[1] = n.y; scratch[2] = n.z;
+        scratch[3] = a.x; scratch[4] = a.y; scratch[5] = a.z;
+        scratch[6] = b.x; scratch[7] = b.y; scratch[8] = b.z;
+        scratch[9] = c.x; scratch[10] = c.y; scratch[11] = c.z;
+        out.set(scratchBytes, offset);
+        offset += 50;
+    };
     for (let pi = 0; pi < visible.length; pi++) {
         const entry = visible[pi];
         entry.mesh.updateMatrixWorld();
@@ -895,24 +990,24 @@ export function exportStlBytes(stitchTolMm = 0) {
             b.fromBufferAttribute(pos, t * 3 + 1).applyMatrix4(matrix);
             c.fromBufferAttribute(pos, t * 3 + 2).applyMatrix4(matrix);
             if (stitch) { stitch.displace(a, pi); stitch.displace(b, pi); stitch.displace(c, pi); }
-            n.copy(ab.subVectors(b, a)).cross(ac.subVectors(c, a)).normalize();
-            scratch[0] = n.x; scratch[1] = n.y; scratch[2] = n.z;
-            scratch[3] = a.x; scratch[4] = a.y; scratch[5] = a.z;
-            scratch[6] = b.x; scratch[7] = b.y; scratch[8] = b.z;
-            scratch[9] = c.x; scratch[10] = c.y; scratch[11] = c.z;
-            out.set(scratchBytes, offset);
-            offset += 50;
+            writeTri();
         }
+    }
+    for (let i = 0; i < bridgeTris; i++) {
+        a.set(bridge[i * 9], bridge[i * 9 + 1], bridge[i * 9 + 2]);
+        b.set(bridge[i * 9 + 3], bridge[i * 9 + 4], bridge[i * 9 + 5]);
+        c.set(bridge[i * 9 + 6], bridge[i * 9 + 7], bridge[i * 9 + 8]);
+        writeTri();
     }
     return out;
 }
 
 /// Uploads the merged STL (e.g. as a Chromatory project model) without the bytes ever passing
 /// through the .NET side — Blazor supplies the URL and auth header, fetch does the rest.
-export async function uploadMerged(url, headerName, headerValue, filename, stitchTolMm = 0) {
-    status(stitchTolMm > 0 ? 'stitching seams + building the merged STL…' : 'building the merged STL…');
+export async function uploadMerged(url, headerName, headerValue, filename, stitchTolMm = 0, mode = 'nudge') {
+    status(stitchTolMm > 0 ? 'closing joint gaps + building the merged STL…' : 'building the merged STL…');
     await new Promise(r => setTimeout(r, 15)); // let the status paint before the bake blocks
-    const bytes = exportStlBytes(stitchTolMm);
+    const bytes = exportStlBytes(stitchTolMm, mode);
     status(`uploading ${(bytes.byteLength / 1048576).toFixed(0)} MB…`);
     try {
         const response = await fetch(url + (url.includes('?') ? '&' : '?') + 'name=' + encodeURIComponent(filename), {
