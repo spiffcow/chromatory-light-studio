@@ -4,6 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Chromatory — News</title>
+    <meta name="description" content="What's new in the Chromatory Light Studio and Assembly Workbench, the free in-browser tools for miniature painters." />
+    <link rel="canonical" href="https://spiffcow.github.io/chromatory-light-studio/news.html" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <style>
         * { box-sizing: border-box; }
@@ -20,6 +22,7 @@
         kbd { background: #2a3138; border-radius: 4px; padding: 0 5px; font-size: 12px; }
         footer { margin-top: 28px; }
     </style>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "c2c420b32a274aa7bb811e3d350df2cc"}'></script>
 </head>
 <body>
 <header>
@@ -27,6 +30,44 @@
     <p class="muted small"><a href="./">← Light Studio</a> · <a href="terms.html">Terms &amp; Conditions</a></p>
 </header>
 <main>
+    <div class="card note">
+        <h2>Early access — July 23, 2026</h2>
+        <p class="muted small">New on the patron build ahead of the monthly release:</p>
+        <ul class="small">
+            <li><b>🖼 Render styles.</b> On top of the material looks, pick a whole-model render
+                style that composes with them: <b>Cel shaded</b>, <b>Value study</b> (greyscale, for
+                reading your values), or <b>Vibrant</b>. Realistic stays the default.</li>
+            <li><b>🎨 Matte paints catch the light now.</b> The matte and flat paint materials
+                were rendering too dark, so the sculpted detail sank into shadow. They now take
+                the studio light the way they should, and the surface reads like it does under
+                real paint. Rigs you saved with a matte look pick this up on their own.</li>
+            <li><b>📱 Smoother on phones.</b> While you orbit or drag, the studio draws at a
+                lighter resolution and snaps back crisp the moment you stop. Spinning a dense
+                model on a phone stays fluid instead of chugging, and desktop is untouched.</li>
+        </ul>
+    </div>
+
+    <div class="card note">
+        <h2>Early access — July 19, 2026</h2>
+        <p class="muted small">New on the patron build ahead of the monthly release:</p>
+        <ul class="small">
+            <li><b>🧭 Navigation cube (Assembly).</b> The little labelled cube in the corner of
+                the view, the one every CAD app has. It turns with your camera so you always know
+                which way is up. Click <b>TOP</b>, <b>FRONT</b> or any face to snap the camera to
+                that view; click the face you are already looking at to flip to the opposite
+                side; drag the cube to orbit freely.</li>
+            <li><b>⬇ Save parts separately (Assembly).</b> Every part now has a download button
+                that saves just that part as its own STL, positioned exactly as placed. Useful
+                for splitting an assembly across print plates, or keeping a posed variant of a
+                single piece.</li>
+            <li class="muted">In the full Chromatory app, the workbench now also <i>cuts</i>:
+                automatic seam detection splits a merged kit back into its parts, and a scissor
+                tool cuts along a line you click out, with the cut snapping itself to the
+                model's creases. Those need the app's local geometry engine, so they are not in
+                the browser tools; a look at them is coming to the Patreon feed.</li>
+        </ul>
+    </div>
+
     <div class="card note">
         <h2>Early access — July 17, 2026</h2>
         <p class="muted small">New on the patron build ahead of the monthly release:</p>
@@ -40,6 +81,10 @@
                 area gets its own <b>Window</b> (how tightly the lit window hugs the far side)
                 and <b>Glow</b> (transmitted brightness) controls in the region palette, so a
                 tiny eye lens and a big chest jewel don't share one setting.</li>
+            <li><b>✨ Glow-region lights.</b> A painted area can now BE a light source — lava,
+                runes, a glowing blade. Pick the area under Regions and add its glow light: it
+                casts real light on the rest of the model, and the area's own surface glows at
+                the light's level — turn the intensity up and the surface burns hotter with it.</li>
             <li><b>Truer NMM metals.</b> The Silver and Gold NMM looks have been retuned —
                 full metallic response with adjusted tints, so the reference highlights sit
                 closer to well-painted NMM.</li>
@@ -106,7 +151,7 @@
 </main>
 <script>
     // Seeing this page clears the "unread" badge on the studio pages.
-    localStorage.setItem('pb-news-seen', '2026-07-17');
+    localStorage.setItem('pb-news-seen', '2026-07-23');
 </script>
 </body>
 </html>

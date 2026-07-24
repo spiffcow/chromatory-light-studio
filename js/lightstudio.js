@@ -6,8 +6,10 @@ import { STLLoader } from '../lib/three/STLLoader.js';
 import { OrbitControls } from '../lib/three/OrbitControls.js';
 import { RoomEnvironment } from '../lib/three/RoomEnvironment.js';
 import { TransformControls } from '../lib/three/TransformControls.js';
+import { createViewCube } from './view-cube.js';
 
 let renderer, scene, camera, controls, canvasEl, hemi, ground;
+let viewCube = null;         // corner navigation cube (click a face to snap the view)
 let axisControl = null;      // translate gizmo (X/Y/Z arrows) for the selected light
 let selectedLightId = null;
 let mesh = null;
@@ -23,13 +25,50 @@ let propSeq = 0;
 // shadow maps over millions of triangles can strain weak GPUs (the standalone runs anywhere).
 let shadowsEnabled = true;
 
+// Render ON DEMAND. The scene is static between interactions, so redrawing a multi-million-triangle
+// mesh at 60 fps just cooks the GPU (mobile especially — the phone-paired viewer). Instead we render
+// only for a short window after something actually changes — a camera move, a light/paint/appearance
+// edit, an async load — then let the loop idle. `invalidate()` (re)opens that window; every mutating
+// path funnels through it (controls 'change', requestShadowUpdate, canvas input, the setters below).
+let renderDeadline = 0;
+let lastRenderAt = 0;
+const RENDER_KEEPALIVE_MS = 1000;      // keep drawing this long after the last change (covers damping + async settle)
+const RENDER_IDLE_HEARTBEAT_MS = 1200; // backstop: even when "idle", redraw at least this often so any change a
+                                       // setter forgot to invalidate() self-heals within ~1s instead of lingering
+function invalidate() { renderDeadline = performance.now() + RENDER_KEEPALIVE_MS; }
+
+// Dynamic resolution. While the camera is moving (or a stroke is dragging), a high-DPI phone would
+// otherwise redraw millions of triangles at up to 4x the pixels. Drop to 1x DURING interaction, snap
+// back to crisp ~1/3s after it settles. Pure fill-rate — touches no geometry, no mask, no saved data,
+// so it can never repeat the LOD-save incident. A no-op on non-retina displays (full == interact == 1).
+const FULL_PIXEL_RATIO = Math.min(window.devicePixelRatio || 1, 2);
+const INTERACT_PIXEL_RATIO = 1;
+const INTERACT_SETTLE_MS = 320;
+let interactTimer = null;
+
+function setRenderScale(ratio) {
+    if (!renderer || Math.abs(renderer.getPixelRatio() - ratio) < 0.01) return;
+    renderer.setPixelRatio(ratio);
+    const size = renderer.getSize(new THREE.Vector2());
+    renderer.setSize(size.x, size.y, false); // false: resize the backing store only, not the CSS box
+}
+
+function markInteracting() {
+    if (FULL_PIXEL_RATIO > INTERACT_PIXEL_RATIO) setRenderScale(INTERACT_PIXEL_RATIO);
+    clearTimeout(interactTimer);
+    interactTimer = setTimeout(() => { setRenderScale(FULL_PIXEL_RATIO); invalidate(); }, INTERACT_SETTLE_MS);
+    invalidate();
+}
+
 /// Re-renders the shadow maps on the next frame (they are frozen between scene changes).
 function requestShadowUpdate() {
     if (renderer && shadowsEnabled) renderer.shadowMap.needsUpdate = true;
+    invalidate();
 }
 
 export function setShadows(on) {
     captureUndo('shadows', false);
+    invalidate();
     shadowsEnabled = !!on;
     if (!renderer) return;
     renderer.shadowMap.enabled = shadowsEnabled;
@@ -182,6 +221,7 @@ function withUndoSuppressed(fn) {
 export function undo() {
     const top = undoStack.pop();
     if (!top) return false;
+    invalidate();
     restoringUndo = true;
     try {
         if (top.paintDiff) {
@@ -210,7 +250,13 @@ function onKeyDown(event) {
 
     if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === 'z') {
         event.preventDefault();
+        // With lasso lines on screen, Ctrl+Z takes back the last placed point (a server round-trip
+        // that notifies on completion); the regular undo stack resumes once the lines are gone.
+        if (lasso && lasso.chains.length > 0) { lassoUndo(); return; }
         if (undo()) notifyChanged();
+    }
+    else if (event.key === 'Escape' && lasso?.picking) {
+        lassoArmPick(false); // back to placing points
     }
     else if (event.key === 'Delete' || event.key === 'Backspace') {
         if (selectedPropId !== null) {
@@ -229,9 +275,19 @@ function onKeyDown(event) {
 // The curated look presets — the SINGLE source of truth consumed by both the in-app studio
 // page (via getLooksJson) and the standalone Light Studio. Values tuned on a real 3M-triangle
 // print (2026-07). "color" omitted = keep the user's current color when switching looks.
-export const LOOKS = {
-    // The NMM looks use plain PBR metal (the user's preference after trying the painted-ramp
-    // shader). The painterly 'nmm' shader stays fully functional — the materials editor creates
+// TWO INDEPENDENT AXES. The MATERIAL is what an unpainted surface is made of (its family + PBR
+// params) — the same vocabulary the per-area region materials use. The RENDER MODE (below) is how
+// the whole model is displayed. They compose: the lit render modes shade whichever material is
+// selected, so "Cel + Gloss" and "Cel + Matte" differ.
+// A matte (diffuse) surface takes its fill from the environment IBL, so a low envIntensity leaves the
+// sculpt sitting in shadow — this is what made the lit view look flat next to paint mode (which fills
+// at 1.0). Matte needs a generous fill; the "Room light" (ambient) slider is the darkness control, not
+// this. Metals were already ~0.75 (they REFLECT the room); diffuse paint was wrongly starved at 0.15.
+const MATTE_ENV = 0.9;
+
+export const MATERIALS = {
+    // The NMM materials use plain PBR metal (the user's preference after trying the painted-ramp
+    // shader). The painterly 'nmm' family stays fully functional — the materials editor creates
     // painted-NMM materials on demand, and rigs saved with one keep rendering it.
     silvernmm: { label: 'Silver NMM', fixedReference: false,
         appearance: { shader: 'pbr', color: '#c8ccd2', metalness: 1.0, roughness: 0.3, clearcoat: 0, envIntensity: 0.75 } },
@@ -244,20 +300,82 @@ export const LOOKS = {
     satin: { label: 'Satin paint', fixedReference: false,
         appearance: { shader: 'pbr', metalness: 0.0, roughness: 0.38, clearcoat: 0, envIntensity: 0.25 } },
     matte: { label: 'Matte paint', fixedReference: false,
-        appearance: { shader: 'pbr', metalness: 0.0, roughness: 0.85, clearcoat: 0, envIntensity: 0.15 } },
-    bands: { label: 'Bands (practice)', fixedReference: false,
-        appearance: { shader: 'toon', toonBands: 4 } },
-    chrome: { label: 'Chrome', fixedReference: true,
-        appearance: { shader: 'matcap', matcap: 'chrome', color: '#ffffff' } },
-    gold: { label: 'Gold', fixedReference: true,
-        appearance: { shader: 'matcap', matcap: 'gold', color: '#ffffff' } },
-    contrast: { label: 'High contrast', fixedReference: true,
-        appearance: { shader: 'matcap', matcap: 'highcontrast', color: '#ffffff' } }
+        appearance: { shader: 'pbr', metalness: 0.0, roughness: 0.85, clearcoat: 0, envIntensity: MATTE_ENV } }
 };
 
-/// The look presets for non-JS consumers (the Blazor page deserializes this).
+// Rigs saved before the fill fix carry the old starved matte envIntensity (~0.15), which renders the
+// sculpt in shadow. Lift it once as the rig loads (NOT on every slider tick, so the Env control still
+// works) — only a diffuse matte with a clearly-too-low fill, so satin/gloss/metals are untouched.
+function migrateLegacyFill(a) {
+    if (a && a.shader === 'pbr' && (a.metalness ?? 0) === 0
+        && (a.roughness ?? 0) >= 0.6 && (a.envIntensity ?? 1) < 0.35) {
+        a.envIntensity = MATTE_ENV;
+    }
+}
+
+// How the whole model is displayed, independent of the material. LIT modes (realistic/cel/value/
+// vibrant) shade the selected material under the lights; REFERENCE modes (cavity + the idealized
+// matcaps) ignore both the material and the lights — the app filters those behind a UiFlag.
+export const RENDER_MODES = {
+    realistic: { label: 'Realistic', fixedReference: false },
+    cel: { label: 'Cel shaded', fixedReference: false },
+    value: { label: 'Value study', fixedReference: false },
+    vibrant: { label: 'Vibrant', fixedReference: false },
+    cavity: { label: 'Cavity', fixedReference: true },
+    chrome: { label: 'Chrome', fixedReference: true, matcap: 'chrome' },
+    gold: { label: 'Gold', fixedReference: true, matcap: 'gold' },
+    contrast: { label: 'High contrast', fixedReference: true, matcap: 'highcontrast' }
+};
+
+// The extra tuning controls each render mode exposes — the SINGLE SOURCE OF TRUTH shared by both
+// shells (the app deserializes it via getRenderModeControlsJson, the standalone reads it directly),
+// so the two never drift. Each entry: the appearance `field` the engine reads (see the defaults and
+// clamps in DEFAULT_APPEARANCE / buildMaterial), the widget `type`, its range/step, `default`, and a
+// tooltip. `when: 'specLocked'` rows apply only while highlights are frozen; `int: true` marks a
+// whole-number range. Labels/tooltips are em-dash-free so they read cleanly in the public standalone.
+export const RENDER_MODE_CONTROLS = {
+    cel: [
+        { field: 'toonBands', label: 'Bands', type: 'range', min: 2, max: 8, step: 1, int: true, default: 4, title: 'How many flat lighting bands' },
+        { field: 'celOutline', label: 'Outline', type: 'range', min: 0, max: 3, step: 0.25, default: 1.0, title: 'Thickness of the inked outline (0 is none)' },
+        { field: 'celOutlineColor', label: 'Ink', type: 'color', default: '#0b0b0e', title: 'Outline ink colour' },
+        { field: 'celSoft', label: 'Soft', type: 'range', min: 0, max: 1, step: 0.05, default: 0.0, title: 'Feather the band edges: 0 is a hard cel, higher softens the transitions' },
+        { field: 'celReflectBands', label: 'Band reflections', type: 'checkbox', default: false, title: 'Also band the environment reflection: harder, flatter cel metals' },
+        { field: 'markWidth', label: 'Mark line', type: 'range', min: 0.5, max: 4, step: 0.5, default: 1.5, when: 'specLocked', title: "Thickness of the frozen 'where to mark' guide lines (only while highlights are locked)" },
+        { field: 'markAuto', label: 'Auto-contrast', type: 'checkbox', default: true, when: 'specLocked', title: 'Auto-pick a light or dark mark so it stays legible on any colour; off uses the ink colour' }
+    ],
+    value: [
+        { field: 'valueSteps', label: 'Steps', type: 'range', min: 2, max: 8, step: 1, int: true, default: 4, title: 'How many flat value steps to collapse the render into' },
+        { field: 'valueGray', label: 'Greyscale', type: 'checkbox', default: true, title: "Greyscale reads pure value; off keeps each area's hue at its stepped value" }
+    ],
+    vibrant: [
+        { field: 'vibrancePunch', label: 'Punch', type: 'range', min: 0, max: 1, step: 0.05, default: 1.0, title: 'Exaggerate the value range: deeper shadows, brighter highlights' },
+        { field: 'vibranceSat', label: 'Sat', type: 'range', min: 1, max: 2, step: 0.05, default: 1.35, title: 'Saturation boost (1 is neutral)' },
+        { field: 'vibranceTemp', label: 'Temp', type: 'range', min: 0, max: 1, step: 0.05, default: 0.3, title: "Warm highlights, cool shadows: the painter's temperature split" }
+    ],
+    cavity: [
+        { field: 'cavityStrength', label: 'Recess', type: 'range', min: 0, max: 2, step: 0.05, default: 1.0, title: 'How dark the recesses / creases go (where washes sit)' },
+        { field: 'cavityEdge', label: 'Edge', type: 'range', min: 0, max: 2, step: 0.05, default: 0.6, title: 'How bright the raised edges go (where edge-highlights sit)' }
+    ]
+};
+
+// Compatibility alias: the standalone shell's surface picker reads studio.LOOKS. Materials ARE that
+// surface; render modes are a separate axis exposed via getRenderModesJson and used only by the app
+// (so the still-experimental render modes stay out of the public standalone until they're released).
+export const LOOKS = MATERIALS;
+
+/// The presets for non-JS consumers (the Blazor page + standalone shell deserialize these).
+/// getLooksJson stays = materials for the standalone; the app uses the two-axis pair below.
 export function getLooksJson() {
     return JSON.stringify(LOOKS);
+}
+export function getMaterialsJson() {
+    return JSON.stringify(MATERIALS);
+}
+export function getRenderModesJson() {
+    return JSON.stringify(RENDER_MODES);
+}
+export function getRenderModeControlsJson() {
+    return JSON.stringify(RENDER_MODE_CONTROLS);
 }
 
 // The model's two materials are long-lived and SWAPPED, never rebuilt per paint-mode toggle:
@@ -270,10 +388,24 @@ let paintMaterial = null;
 
 // Current appearance state (kept so shader switches preserve color etc., and for getSetup()).
 const appearance = {
-    shader: 'pbr',          // 'pbr' | 'phong' | 'matcap' | 'toon' | 'nmm'
+    shader: 'pbr',          // MATERIAL family: 'pbr' | 'phong' | 'matcap' | 'nmm'
+    renderMode: 'realistic',// RENDER MODE: 'realistic' | 'cel' | 'value' | 'vibrant' | 'cavity' | 'chrome' | 'gold' | 'contrast'
     matcap: 'chrome',
     nmmMetal: 'steel',      // nmm: which authored ramp ('steel' | 'gold')
-    toonBands: 4,
+    toonBands: 4,           // toon + cel: how many flat lighting bands
+    celOutline: 1.0,        // cel: inked-outline thickness (0 = none)
+    celOutlineColor: '#0b0b0e',
+    markWidth: 1.5,         // cel + lock: frozen "where to mark" line thickness (px half-width)
+    markAuto: true,         // cel + lock: auto-contrast the marks (light on dark, dark on light)
+    celSoft: 0.0,           // cel: band-edge softness (0 hard … 1 smooth)
+    celReflectBands: false, // cel: also band the environment reflection (harder cel metals)
+    valueSteps: 4,          // value study: number of flat value steps
+    valueGray: true,        // value study: greyscale (true) or keep hue
+    vibrancePunch: 1.0,     // vibrant: exaggerate the value range (0 none … 2 strong)
+    vibranceSat: 1.35,      // vibrant: saturation boost
+    vibranceTemp: 0.3,      // vibrant: warm-highlight / cool-shadow shift
+    cavityStrength: 1.0,    // cavity: how dark recesses go
+    cavityEdge: 0.6,        // cavity: how bright convex edges go
     color: '#c8ccd2',       // Silver NMM default (matches LightStudio.razor's default look)
     specular: '#ffffff',    // phong: hotspot color
     shininess: 90,          // phong: hotspot tightness
@@ -289,10 +421,12 @@ const appearance = {
 
 export function init(canvas) {
     canvasEl = canvas;
-    renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+    // No preserveDrawingBuffer: screenshot() renders immediately before toDataURL in the same tick,
+    // so the buffer is valid without it — and keeping it forces a slower compositing path every frame.
+    renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     // Cap the backing store: dpr beyond 2 quadruples fill cost on a 3M-triangle scene for no
     // visible gain, and VRAM headroom matters — the same GPU often hosts the local AI models.
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setPixelRatio(FULL_PIXEL_RATIO);
 
     // A lost WebGL context (driver reset, VRAM pressure from local AI) otherwise leaves the
     // canvas permanently blank. preventDefault opts into restoration; on restore, rebuild the
@@ -340,6 +474,11 @@ export function init(canvas) {
     // everything away — which reads as the render "going blank".
     controls.minDistance = 15;
     controls.maxDistance = 1200;
+    // Any camera change (drag, zoom, pan, damping inertia) reopens the render window; a raw pointer/
+    // wheel/touch on the canvas does too, so paint strokes and gizmo drags redraw even before their
+    // state handlers fire.
+    controls.addEventListener('change', markInteracting);
+    for (const ev of ['pointerdown', 'pointermove', 'wheel', 'pointerup']) canvas.addEventListener(ev, markInteracting);
 
     // Precise placement: clicking a light handle shows X/Y/Z arrows; dragging an arrow moves
     // the light along that axis only. Free drag on the ball itself still works.
@@ -402,11 +541,18 @@ export function init(canvas) {
     // Right-drag erases in paint mode — the browser menu would swallow the gesture.
     canvas.addEventListener('contextmenu', event => event.preventDefault());
 
+    viewCube = createViewCube(renderer, camera, controls, canvas);
+
+    invalidate(); // draw the opening frames while the scene, environment and shadows settle
     renderer.setAnimationLoop(() => {
-        processPendingPaint();
-        controls.update();
+        processPendingPaint();          // a queued paint invalidates as it applies
+        controls.update();              // damping must tick every frame; its 'change' reopens the window
+        const now = performance.now();
+        if (now > renderDeadline && now - lastRenderAt < RENDER_IDLE_HEARTBEAT_MS) return; // idle — skip the redraw
+        lastRenderAt = now;
         syncStudioUniforms();
         renderer.render(scene, camera);
+        viewCube?.render(); // captures re-render the scene first, so they never include the cube
     });
 }
 
@@ -417,15 +563,20 @@ function buildEnvironment() {
     const pmrem = new THREE.PMREMGenerator(renderer);
     scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
     pmrem.dispose();
+    invalidate(); // the new reflections need a redraw
 }
 
 export function dispose() {
+    exitLasso();
     renderer?.setAnimationLoop(null);
     window.removeEventListener('resize', resize);
     window.removeEventListener('keydown', onKeyDown);
+    viewCube?.dispose();
+    viewCube = null;
 
     // Free every GPU resource the scene holds (renderer.dispose alone does NOT) — the model geometry
     // can be hundreds of MB, so leaking it across open/close cycles is how the studio runs out of memory.
+    if (celOutline) { celOutline.material.dispose(); celOutline = null; }
     if (mesh) { mesh.geometry.dispose(); mesh = null; }
     lookMaterial?.dispose();
     lookMaterial = null;
@@ -450,6 +601,7 @@ export function dispose() {
 
 function resize() {
     if (!canvasEl || !renderer) return;
+    invalidate();
     const w = canvasEl.clientWidth || 800;
     const h = canvasEl.clientHeight || 600;
     renderer.setSize(w, h, false);
@@ -543,6 +695,8 @@ function smoothSoupNormals(geometry, creaseDeg = 60) {
 }
 
 export function loadStl(bytes) {
+    exitLasso(); // the overlay hangs off the old mesh, and the session's graph is the old geometry
+    if (celOutline) { celOutline.material.dispose(); celOutline = null; } // shares the old geometry
     if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); }
     resetRegions(); // a new geometry invalidates any painted mask (before the material rebuild reads attr state)
     lookMaterial?.dispose();
@@ -610,6 +764,7 @@ export function resetOrientation() {
 }
 
 function applyOrientationDelta(delta) {
+    exitLasso(); // reorienting bakes into the positions — the service's crease graph is now stale
     const geometry = mesh.geometry;
 
     // Rotate about the model's current center so it pivots in place…
@@ -907,6 +1062,244 @@ function toonGradient(bands) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Cel shading — a full RENDER MODE on the physical material. Because it's the physical material, the
+// region patch (metal/gem/translucent/tint) renders exactly as on the PBR look; the cel patch only
+// quantises the accumulated DIRECT lighting into flat bands (a spot no other patch touches, so it
+// composes with them), and an inverted-hull outline mesh inks the silhouette + hard creases.
+// ---------------------------------------------------------------------------------------------
+function applyCelPatch(material) {
+    material.userData.celBands = { value: Math.max(2, Math.min(8, appearance.toonBands || 4)) };
+    material.userData.celSoft = { value: Math.max(0, Math.min(1, appearance.celSoft ?? 0)) };
+    // Frozen "where to mark" ink (see setSpecularLock): a contour drawn ON the surface wherever the
+    // normal grazes a FROZEN world direction — the silhouette locus for that direction. Held for the
+    // locked view AND its azimuth-flip, so the outline rides the model and stays put as you orbit,
+    // telling you exactly where to lay the edge line for both display angles. Always compiled in,
+    // gated by uInkOn so toggling the lock never triggers a recompile.
+    material.userData.inkOn = material.userData.inkOn || { value: 0 };
+    material.userData.inkAuto = material.userData.inkAuto || { value: 1 };
+    material.userData.inkDirA = material.userData.inkDirA || { value: new THREE.Vector3(1, 0, 0) };
+    material.userData.inkDirB = material.userData.inkDirB || { value: new THREE.Vector3(-1, 0, 0) };
+    material.userData.inkWidth = material.userData.inkWidth || { value: 1.5 };
+    material.userData.inkColor = material.userData.inkColor || { value: new THREE.Color(appearance.celOutlineColor ?? '#0b0b0e') };
+    const reflect = !!appearance.celReflectBands; // baked into the shader → part of the cache key
+    const prev = material.onBeforeCompile;
+    material.onBeforeCompile = shader => {
+        if (prev) prev(shader);
+        shader.uniforms.uCelBands = material.userData.celBands;
+        shader.uniforms.uCelSoft = material.userData.celSoft;
+        shader.uniforms.uInkOn = material.userData.inkOn;
+        shader.uniforms.uInkAuto = material.userData.inkAuto;
+        shader.uniforms.uInkDirA = material.userData.inkDirA;
+        shader.uniforms.uInkDirB = material.userData.inkDirB;
+        shader.uniforms.uInkWidth = material.userData.inkWidth;
+        shader.uniforms.uInkColor = material.userData.inkColor;
+        shader.fragmentShader = shader.fragmentShader
+            .replace('void main() {',
+                'uniform float uCelBands;\nuniform float uCelSoft;\n' +
+                'uniform float uInkOn;\nuniform float uInkAuto;\nuniform vec3 uInkDirA;\nuniform vec3 uInkDirB;\n' +
+                'uniform float uInkWidth;\nuniform vec3 uInkColor;\n' +
+                // Quantise luminance into flat bands. uCelSoft feathers each band edge (smoothstep
+                // over a widening window) without removing the banding — hard cel at 0, soft at 1.
+                'float chromBandLum( float l ) {\n' +
+                '  float x = l * uCelBands;\n' +
+                '  float k = clamp( uCelSoft, 0.0, 1.0 ) * 0.5 + 0.0015;\n' +
+                '  return ( floor( x ) + smoothstep( 0.5 - k, 0.5 + k, fract( x ) ) ) / uCelBands;\n' +
+                '}\n' +
+                'vec3 chromCelBand( vec3 c ) {\n' +
+                '  float l = max( max( c.r, c.g ), c.b );\n' +
+                '  if ( l < 1e-4 ) return c;\n' +
+                '  return c * ( chromBandLum( l ) / l );\n' + // step luminance, keep hue
+                '}\nvoid main() {')
+            .replace('#include <lights_fragment_end>',
+                '#include <lights_fragment_end>\n' +
+                '\treflectedLight.directDiffuse  = chromCelBand( reflectedLight.directDiffuse );\n' +
+                '\treflectedLight.directSpecular = chromCelBand( reflectedLight.directSpecular );' +
+                // Optionally band the environment reflection too, for harder cel metals.
+                (reflect ? '\n\treflectedLight.indirectSpecular = chromCelBand( reflectedLight.indirectSpecular );' : ''))
+            // Frozen silhouette ink, in linear space so it tonemaps/encodes with the rest. The dirs
+            // arrive already re-expressed in view space (syncStudioUniforms), matching the view-space
+            // normal, so |dot| is the true world-space grazing term and the mark is glued to the mesh.
+            .replace('#include <opaque_fragment>',
+                '#include <opaque_fragment>\n' +
+                'if ( uInkOn > 0.5 ) {\n' +
+                '  vec3 inkN = normalize( normal );\n' +
+                '  float g = min( abs( dot( inkN, uInkDirA ) ), abs( dot( inkN, uInkDirB ) ) );\n' +
+                // Divide the grazing term by its screen-space gradient so the mark is a roughly
+                // CONSTANT-WIDTH line (uInkWidth ~ half-width in pixels) instead of a broad fill on
+                // surfaces that graze the frozen direction over a wide area.
+                '  float aa = max( fwidth( g ), 1e-5 );\n' +
+                '  float ink = 1.0 - smoothstep( 0.0, uInkWidth * aa, g );\n' +
+                // Auto-contrast: pick a light or dark mark from the underlying LINEAR luminance so the
+                // guide is legible on any colour (0.2 linear ≈ mid-grey sRGB). Else use the set colour.
+                '  float lum = dot( gl_FragColor.rgb, vec3( 0.2126, 0.7152, 0.0722 ) );\n' +
+                '  vec3 markCol = ( uInkAuto > 0.5 ) ? mix( vec3( 0.96 ), vec3( 0.02 ), smoothstep( 0.12, 0.30, lum ) ) : uInkColor;\n' +
+                '  gl_FragColor.rgb = mix( gl_FragColor.rgb, markCol, ink );\n' +
+                '}');
+    };
+    const prevKey = material.customProgramCacheKey;
+    material.customProgramCacheKey = () => (prevKey ? prevKey.call(material) : '') + '|cel' + (reflect ? 'R' : '');
+    return material;
+}
+
+let celOutline = null;
+const CEL_OUTLINE_BASE = 0.006; // outline thickness at slider = 1, as a fraction of the model radius
+
+function celOutlineThickness() {
+    return modelRadius * CEL_OUTLINE_BASE * (appearance.celOutline ?? 1.0);
+}
+
+function makeCelOutlineMaterial() {
+    return new THREE.ShaderMaterial({
+        uniforms: {
+            uThickness: { value: celOutlineThickness() },
+            uColor: { value: new THREE.Color(appearance.celOutlineColor ?? '#0b0b0e') }
+        },
+        vertexShader:
+            'uniform float uThickness;\n' +
+            'void main() {\n' +
+            '  vec3 p = position + normalize( normal ) * uThickness;\n' +
+            '  gl_Position = projectionMatrix * modelViewMatrix * vec4( p, 1.0 );\n' +
+            '}',
+        fragmentShader:
+            'uniform vec3 uColor;\n' +
+            'void main() { gl_FragColor = vec4( uColor, 1.0 ); }',
+        side: THREE.BackSide
+    });
+}
+
+/// The inked outline: an inverted hull — the model geometry re-drawn as an expanded black back-face
+/// shell that shows only where it pokes past the silhouette and hard creases. A CHILD of the mesh
+/// (shares its geometry + transform), present only in the cel look and never in paint mode.
+function updateCelOutline() {
+    // While highlights are locked the frozen surface contour replaces the live silhouette hull.
+    const want = !!mesh && appearance.renderMode === 'cel' && !paintMode && (appearance.celOutline ?? 1.0) > 0 && !inkLock.on;
+    if (celOutline && (!want || celOutline.userData.geo !== mesh.geometry)) {
+        celOutline.parent?.remove(celOutline);
+        celOutline.material.dispose();
+        celOutline = null;
+    }
+    if (want && !celOutline) {
+        celOutline = new THREE.Mesh(mesh.geometry, makeCelOutlineMaterial());
+        celOutline.userData.geo = mesh.geometry;
+        celOutline.castShadow = false;
+        celOutline.receiveShadow = false;
+        celOutline.renderOrder = -1; // behind the model; the model overdraws all but the rim
+        mesh.add(celOutline);
+    } else if (want && celOutline) {
+        celOutline.material.uniforms.uThickness.value = celOutlineThickness();
+        celOutline.material.uniforms.uColor.value.set(appearance.celOutlineColor ?? '#0b0b0e');
+    }
+}
+
+// Value study — a painter's planning mode. Built on the physical material (so painted regions
+// contribute their real value: metal reflects, gems transmit, tints apply), then the FINAL
+// display colour is posterised into a handful of flat value steps. Grey collapses hue so you
+// read pure value; colour keeps the hue at the stepped value. Live: step count + grey toggle.
+function applyValuePatch(material) {
+    material.userData.valSteps = { value: Math.max(2, Math.min(8, appearance.valueSteps || 4)) };
+    material.userData.valGray = { value: (appearance.valueGray ?? true) ? 1 : 0 };
+    const prev = material.onBeforeCompile;
+    material.onBeforeCompile = shader => {
+        if (prev) prev(shader);
+        shader.uniforms.uValSteps = material.userData.valSteps;
+        shader.uniforms.uValGray = material.userData.valGray;
+        shader.fragmentShader = shader.fragmentShader
+            .replace('void main() {', 'uniform float uValSteps;\nuniform float uValGray;\nvoid main() {')
+            .replace('#include <colorspace_fragment>',
+                '#include <colorspace_fragment>\n' +
+                '{\n' +
+                '  float v = dot( gl_FragColor.rgb, vec3( 0.2126, 0.7152, 0.0722 ) );\n' +
+                '  float stepped = clamp( floor( v * uValSteps + 0.5 ) / uValSteps, 0.0, 1.0 );\n' +
+                '  vec3 hue = ( v > 1e-4 ) ? gl_FragColor.rgb * ( stepped / v ) : vec3( 0.0 );\n' +
+                '  gl_FragColor.rgb = mix( hue, vec3( stepped ), uValGray );\n' +
+                '}');
+    };
+    const prevKey = material.customProgramCacheKey;
+    material.customProgramCacheKey = () => (prevKey ? prevKey.call(material) : '') + '|value';
+    return material;
+}
+
+// Vibrant — the "well-painted mini" look. Real minis exaggerate what a photo flattens: a wider
+// value range (deeper shadows, brighter highlights), punchier saturation, and a warm-highlight /
+// cool-shadow temperature split. Built on the physical material so painted regions still read.
+// An S-curve exaggerates the direct diffuse range; saturation + temperature are applied to the
+// final display colour. All three amounts are live uniforms.
+function applyVibrantPatch(material) {
+    material.userData.vibPunch = { value: Math.max(0, appearance.vibrancePunch ?? 1) };
+    material.userData.vibSat = { value: Math.max(0, appearance.vibranceSat ?? 1.35) };
+    material.userData.vibTemp = { value: Math.max(0, appearance.vibranceTemp ?? 0.3) };
+    const prev = material.onBeforeCompile;
+    material.onBeforeCompile = shader => {
+        if (prev) prev(shader);
+        shader.uniforms.uVibPunch = material.userData.vibPunch;
+        shader.uniforms.uVibSat = material.userData.vibSat;
+        shader.uniforms.uVibTemp = material.userData.vibTemp;
+        shader.fragmentShader = shader.fragmentShader
+            .replace('void main() {',
+                'uniform float uVibPunch;\nuniform float uVibSat;\nuniform float uVibTemp;\n' +
+                'vec3 chromSCurve( vec3 c, float amt ) {\n' +          // deepen shadows + lift highlights
+                '  vec3 s = c * c * ( 3.0 - 2.0 * c );\n' +            // smoothstep contrast on [0,1]
+                '  return mix( c, s, clamp( amt, 0.0, 1.0 ) );\n' +
+                '}\nvoid main() {')
+            .replace('#include <lights_fragment_end>',
+                '#include <lights_fragment_end>\n' +
+                '\treflectedLight.directDiffuse = chromSCurve( clamp( reflectedLight.directDiffuse, 0.0, 1.0 ), uVibPunch );')
+            .replace('#include <colorspace_fragment>',
+                '#include <colorspace_fragment>\n' +
+                '{\n' +
+                '  float luma = dot( gl_FragColor.rgb, vec3( 0.2126, 0.7152, 0.0722 ) );\n' +
+                '  gl_FragColor.rgb = mix( vec3( luma ), gl_FragColor.rgb, uVibSat );\n' +      // saturation
+                '  float t = ( luma - 0.5 ) * uVibTemp * 0.5;\n' +
+                '  gl_FragColor.rgb += vec3( t, t * 0.15, -t );\n' +                            // warm ↑ / cool ↓
+                '  gl_FragColor.rgb = clamp( gl_FragColor.rgb, 0.0, 1.0 );\n' +
+                '}');
+    };
+    const prevKey = material.customProgramCacheKey;
+    material.customProgramCacheKey = () => (prevKey ? prevKey.call(material) : '') + '|vibrant';
+    return material;
+}
+
+// Cavity — a fixed reference (ignores the scene lights) that reads the SCULPT: recesses and
+// creases darken, raised edges lighten. Curvature comes from screen-space derivatives of the
+// view normal vs. view position, scaled by the model radius so it's size-invariant. This is
+// exactly the map miniature painters plan washes (concave) and edge-highlights (convex) from.
+function buildCavityMaterial() {
+    const material = new THREE.ShaderMaterial({
+        uniforms: {
+            uCavity: { value: Math.max(0, appearance.cavityStrength ?? 1) },
+            uEdge: { value: Math.max(0, appearance.cavityEdge ?? 0.6) },
+            uScale: { value: Math.max(1e-3, modelRadius) },
+            uBase: { value: new THREE.Color('#b9b9be') }
+        },
+        vertexShader:
+            'varying vec3 vN;\nvarying vec3 vP;\n' +
+            'void main() {\n' +
+            '  vN = normalMatrix * normal;\n' +
+            '  vec4 mv = modelViewMatrix * vec4( position, 1.0 );\n' +
+            '  vP = mv.xyz;\n' +
+            '  gl_Position = projectionMatrix * mv;\n' +
+            '}',
+        fragmentShader:
+            'uniform float uCavity;\nuniform float uEdge;\nuniform float uScale;\nuniform vec3 uBase;\n' +
+            'varying vec3 vN;\nvarying vec3 vP;\n' +
+            'void main() {\n' +
+            '  vec3 n = normalize( vN );\n' +
+            '  vec3 dpx = dFdx( vP );\n' +
+            '  vec3 dpy = dFdy( vP );\n' +
+            '  float cx = dot( dFdx( n ), dpx ) / max( dot( dpx, dpx ), 1e-8 );\n' +
+            '  float cy = dot( dFdy( n ), dpy ) / max( dot( dpy, dpy ), 1e-8 );\n' +
+            '  float curv = ( cx + cy ) * uScale;\n' +   // signed, size-invariant curvature
+            '  float concave = clamp( -curv, 0.0, 1.0 );\n' +
+            '  float convex  = clamp(  curv, 0.0, 1.0 );\n' +
+            '  float shade = 1.0 - uCavity * concave + uEdge * convex;\n' +
+            '  gl_FragColor = vec4( uBase * clamp( shade, 0.0, 1.7 ), 1.0 );\n' +
+            '}'
+    });
+    material.extensions = { derivatives: true }; // no-op on WebGL2; safety for a WebGL1 fallback
+    return material;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Studio shader patches — lock-specular and painterly shadows.
 //
 // Lock specular: painted highlights don't move — NMM is painted from ONE chosen viewpoint.
@@ -924,6 +1317,15 @@ let shadowTintColor = '#000000';
 let shadowStrength = 1.0;
 
 const _lockedCamView = new THREE.Vector3();
+
+// Frozen "where to mark" ink: the two world-space silhouette directions captured when the lock
+// engages (the locked view direction and its azimuth-flip). Drives the cel material's contour.
+const inkLock = { on: false, dirA: new THREE.Vector3(), dirB: new THREE.Vector3() };
+const _inkView = new THREE.Vector3();
+const _inkUp = new THREE.Vector3();
+const _inkVert = new THREE.Vector3();
+const _inkHoriz = new THREE.Vector3();
+const _inkOrigin = new THREE.Vector3();
 
 /// Patches a lit material's lights chunk. Applied to the model and the ground — the only lit
 /// materials in the scene (gizmos and arrows are unlit).
@@ -973,13 +1375,43 @@ function syncStudioUniforms() {
         shader.uniforms.uShadowTint.value.set(shadowTintColor);
         shader.uniforms.uShadowStrength.value = shadowStrength;
     }
+    // Frozen-ink contour on the cel material: re-express the locked world directions in the CURRENT
+    // view space each frame (they meet the view-space normal in the shader), so the marks stay glued
+    // to the surface as the camera orbits.
+    const inkMat = mesh?.material;
+    if (inkMat?.userData?.inkOn) {
+        const on = inkLock.on && appearance.renderMode === 'cel' && !paintMode;
+        inkMat.userData.inkOn.value = on ? 1 : 0;
+        if (on) {
+            inkMat.userData.inkDirA.value.copy(inkLock.dirA).transformDirection(camera.matrixWorldInverse);
+            inkMat.userData.inkDirB.value.copy(inkLock.dirB).transformDirection(camera.matrixWorldInverse);
+            inkMat.userData.inkWidth.value = Math.max(0.25, appearance.markWidth ?? 1.5); // px half-width
+            inkMat.userData.inkAuto.value = (appearance.markAuto ?? true) ? 1 : 0;
+            inkMat.userData.inkColor.value.set(appearance.celOutlineColor ?? '#0b0b0e');
+        }
+    }
 }
 
 /// Locking captures the highlights as seen RIGHT NOW; unlocking goes back to live reflections.
 export function setSpecularLock(on) {
     captureUndo('speclock', false);
+    invalidate();
     specLock.on = !!on;
-    if (specLock.on && camera) specLock.camPos.copy(camera.position);
+    inkLock.on = specLock.on;
+    if (specLock.on && camera) {
+        specLock.camPos.copy(camera.position);
+        // The silhouette to mark is where the surface grazes the view direction. Capture that
+        // direction now, plus its azimuth-flip (opposite x/y, SAME elevation about the view up),
+        // so the front and back display angles each get their edge line — frozen in world space.
+        const tgt = controls?.target ?? _inkOrigin;
+        const view = _inkView.subVectors(tgt, camera.position).normalize();
+        const up = _inkUp.copy(camera.up).normalize();
+        const vert = _inkVert.copy(up).multiplyScalar(view.dot(up)); // component along the view up
+        const horiz = _inkHoriz.subVectors(view, vert);              // ground-plane component
+        inkLock.dirA.copy(view);
+        inkLock.dirB.copy(vert).sub(horiz).normalize();              // flip azimuth, keep elevation
+    }
+    updateCelOutline(); // swap the live silhouette hull for the frozen contour (or restore it)
 }
 
 export function getSpecularLock() {
@@ -988,6 +1420,7 @@ export function getSpecularLock() {
 
 export function setShadowTint(options) {
     captureUndo('shadowtint', true);
+    invalidate();
     if (options.color !== undefined) shadowTintColor = options.color;
     if (options.strength !== undefined) shadowStrength = Math.min(1, Math.max(0, options.strength));
 }
@@ -1004,6 +1437,7 @@ function rebuildLookMaterial() {
     lookMaterial = buildMaterial();
     lookMaterial.userData.regionPatch = !!regionSurfAttr;
     if (mesh && !paintMode) mesh.material = lookMaterial;
+    updateCelOutline(); // add/remove the inked outline as the look changes
     return lookMaterial;
 }
 
@@ -1019,68 +1453,80 @@ function ensurePaintMaterial() {
 
 function buildMaterial(withRegions = true) {
     const color = new THREE.Color(appearance.color);
-    switch (appearance.shader) {
-        case 'matcap': {
-            // Fixed idealized reflection — deliberately IGNORES the scene lights, and skips tone
-            // mapping so the authored reference colors arrive on screen untouched. A custom
-            // recipe (materials editor) takes precedence over the preset name.
-            const texture = appearance.matcapDef && typeof appearance.matcapDef === 'object'
-                ? matcapTextureFromDef(appearance.matcapDef)
-                : matcapTexture(appearance.matcap);
-            const material = new THREE.MeshMatcapMaterial({ color, matcap: texture });
-            material.toneMapped = false;
-            return material;
-        }
-        case 'toon': {
-            // Half the color internally: physically-bright lights would otherwise push every
-            // band to the top and the band edges — the whole point of this look — vanish.
-            const dimmed = color.clone().multiplyScalar(0.5);
-            return applyStudioShaderPatches(
-                new THREE.MeshToonMaterial({ color: dimmed, gradientMap: toonGradient(appearance.toonBands) }));
-        }
-        case 'phong':
-            // Exaggerated NMM metal that FOLLOWS the user's lights: dark metal body with big
-            // punchy painterly hotspots — the classic look NMM tutorials paint from.
-            return applyStudioShaderPatches(new THREE.MeshPhongMaterial({
-                color,
-                specular: new THREE.Color(appearance.specular ?? '#ffffff'),
-                shininess: appearance.shininess ?? 90
-            }));
-        case 'nmm': {
-            // Painterly NMM on the PHYSICAL material (metalness 0 = Lambert diffuse), so the
-            // region patch attaches exactly as it does for the pbr looks: painted regions keep
-            // their tints, per-region surfaces, and gem behaviour, while UNPAINTED fragments get
-            // the authored ramp. The base colour is WHITE so the lit result measures pure light
-            // response; tone mapping is skipped so ramp colours arrive on screen untouched.
-            // Roughness gives a broad specular lobe the patch re-thresholds into a crisp painted
-            // hotspot (a tight lobe would miss every camera-facing plane and never show).
-            const hasRegions = withRegions && !!regionSurfAttr;
-            const material = applyStudioShaderPatches(new THREE.MeshPhysicalMaterial({
-                color: '#ffffff',
-                metalness: 0,
-                roughness: 0.30,
-                envMapIntensity: (appearance.envIntensity ?? 0.75) * ambientEnvScale()
-            }));
-            const { def, key } = resolveNmmDef();
-            applyNmmRampPatch(material, def, key + (hasRegions ? '|regions' : ''), hasRegions);
-            material.toneMapped = false;
-            return hasRegions ? applyRegionSurfacePatch(material, true) : material;
-        }
-        default: {
-            const material = applyStudioShaderPatches(new THREE.MeshPhysicalMaterial({
-                color,
-                metalness: appearance.metalness,
-                roughness: appearance.roughness,
-                clearcoat: appearance.clearcoat,
-                // Scaled by the ambient "room light" level — metals show the room, not the fill.
-                envMapIntensity: (appearance.envIntensity ?? 0.4) * ambientEnvScale()
-            }));
-            // Painted regions with their own material (metal armour on a matte look…) override the
-            // surface per vertex. Model only — props have no regions — and only once the region
-            // buffers exist, so an unpainted model compiles no extra attributes.
-            return withRegions && regionSurfAttr ? applyRegionSurfacePatch(material, true) : material;
-        }
+    const mode = appearance.renderMode || 'realistic';
+
+    // ---- REFERENCE render modes: ignore BOTH the material and the scene lights. ----
+    if (mode === 'cavity')
+        // Curvature/cavity map — reads the sculpt (recesses dark, edges light), no lights/regions.
+        return buildCavityMaterial();
+    if (mode === 'chrome' || mode === 'gold' || mode === 'contrast') {
+        // Idealized matcap reference, independent of the chosen material; skips tone mapping so the
+        // authored reference colours arrive on screen untouched.
+        const material = new THREE.MeshMatcapMaterial({
+            color: new THREE.Color('#ffffff'),
+            matcap: matcapTexture(mode === 'contrast' ? 'highcontrast' : mode)
+        });
+        material.toneMapped = false;
+        return material;
     }
+
+    // ---- The BASE MATERIAL — what the unpainted surface is (its family + params). ----
+    const family = appearance.shader || 'pbr';
+    if (family === 'matcap') {
+        // A CUSTOM matcap material (materials editor): a fixed reflection surface that ignores the
+        // lights, so the lit render-mode stylisations don't apply — it renders as itself.
+        const texture = appearance.matcapDef && typeof appearance.matcapDef === 'object'
+            ? matcapTextureFromDef(appearance.matcapDef)
+            : matcapTexture(appearance.matcap);
+        const material = new THREE.MeshMatcapMaterial({ color, matcap: texture });
+        material.toneMapped = false;
+        return material;
+    }
+    if (family === 'nmm') {
+        // Painterly NMM ramp on the PHYSICAL material: an already-stylised metal whose ramp replaces
+        // the physical lighting the cel/value/vibrant patches target, so it renders as itself. The
+        // region patch still attaches. White base measures pure light response; tone mapping off.
+        const hasRegions = withRegions && !!regionSurfAttr;
+        const material = applyStudioShaderPatches(new THREE.MeshPhysicalMaterial({
+            color: '#ffffff', metalness: 0, roughness: 0.30,
+            envMapIntensity: (appearance.envIntensity ?? 0.75) * ambientEnvScale()
+        }));
+        const { def, key } = resolveNmmDef();
+        applyNmmRampPatch(material, def, key + (hasRegions ? '|regions' : ''), hasRegions);
+        material.toneMapped = false;
+        return hasRegions ? applyRegionSurfacePatch(material, true) : material;
+    }
+
+    let material;
+    if (family === 'phong') {
+        // Exaggerated NMM metal that follows the lights: dark body, big punchy painterly hotspots.
+        material = applyStudioShaderPatches(new THREE.MeshPhongMaterial({
+            color,
+            specular: new THREE.Color(appearance.specular ?? '#ffffff'),
+            shininess: appearance.shininess ?? 90
+        }));
+    } else {
+        // pbr: the physical material, taking its metalness/roughness/clearcoat from the chosen
+        // MATERIAL. envMapIntensity scales with the ambient "room light" — metals show the room.
+        material = applyStudioShaderPatches(new THREE.MeshPhysicalMaterial({
+            color,
+            metalness: appearance.metalness,
+            roughness: appearance.roughness,
+            clearcoat: appearance.clearcoat,
+            envMapIntensity: (appearance.envIntensity ?? 0.4) * ambientEnvScale()
+        }));
+    }
+
+    // ---- The RENDER MODE stylises the lit material (realistic = no stylisation). Because these
+    // patch the physical lighting, they compose with the material: cel-shaded gloss differs from
+    // cel-shaded matte, a value study of a metal reads its reflections, etc. ----
+    if (mode === 'cel') applyCelPatch(material);
+    else if (mode === 'value') applyValuePatch(material);
+    else if (mode === 'vibrant') applyVibrantPatch(material);
+
+    // Painted regions with their own material (metal armour on a matte surface…) override per vertex.
+    // Model only, once the region buffers exist, so an unpainted model compiles no extra attributes.
+    return (withRegions && regionSurfAttr) ? applyRegionSurfacePatch(material, true) : material;
 }
 
 // The "room light" level. Hemisphere fill alone only reaches DIFFUSE materials — the metal
@@ -1107,6 +1553,7 @@ export function setToneMapping(mode, exposure) {
 export function setEnvironmentLight(options) {
     if (!hemi) return;
     captureUndo('ambient', true);
+    invalidate();
     if (options.intensity !== undefined) {
         ambientLevel = Math.max(0, options.intensity);
         hemi.intensity = ambientLevel;
@@ -1121,11 +1568,33 @@ export function setEnvironmentLight(options) {
 
 // Appearance keys that drive LIVE uniforms: changing only these updates values in place —
 // no material rebuild, no shader recompile — so their sliders stay smooth to drag.
-const LIVE_APPEARANCE_KEYS = new Set(['gemPower', 'gemGain', 'nmmGain', 'nmmContrast']);
+const LIVE_APPEARANCE_KEYS = new Set(['gemPower', 'gemGain', 'nmmGain', 'nmmContrast', 'celOutline', 'celOutlineColor',
+    'celSoft', 'valueSteps', 'valueGray', 'vibrancePunch', 'vibranceSat', 'vibranceTemp', 'cavityStrength', 'cavityEdge',
+    'markWidth', 'markAuto']); // frozen "where to mark" ink — live uniforms, no rebuild
+
+// Migrate the legacy single-axis `shader` (which conflated material + render mode) onto the
+// two-axis model: a material family in `shader` + a display style in `renderMode`. Idempotent, so
+// it's safe to run on every setAppearance — old saved rigs carry `shader: 'cel'` etc. and no
+// `renderMode`; new callers set `renderMode` directly and this leaves them alone.
+function normalizeAppearance() {
+    const legacyModes = { cel: 'cel', value: 'value', vibrant: 'vibrant', cavity: 'cavity', toon: 'cel' };
+    if (appearance.shader in legacyModes) {
+        appearance.renderMode = legacyModes[appearance.shader];
+        appearance.shader = 'pbr';
+    } else if (appearance.shader === 'matcap' && !appearance.matcapDef) {
+        // A shipped chrome/gold/high-contrast matcap look → the matching reference render mode
+        // (a CUSTOM matcap material has a matcapDef and stays a material).
+        const m = { chrome: 'chrome', gold: 'gold', highcontrast: 'contrast' }[appearance.matcap];
+        if (m) { appearance.renderMode = m; appearance.shader = 'pbr'; }
+    }
+    if (!appearance.renderMode) appearance.renderMode = 'realistic';
+}
 
 export function setAppearance(update) {
     captureUndo('appearance', true);
+    invalidate();
     Object.assign(appearance, update);
+    normalizeAppearance();
     if (update.gemPower !== undefined) gemParams.power = Math.max(0.2, Number(update.gemPower) || 1.35);
     if (update.gemGain !== undefined) gemParams.gain = Math.max(0, Number(update.gemGain) || 2.4);
     if (update.gemPower !== undefined || update.gemGain !== undefined) syncGemParams();
@@ -1135,6 +1604,31 @@ export function setAppearance(update) {
         if (shader?.uniforms?.uNmmGain) {
             shader.uniforms.uNmmGain.value = def.gain * Math.max(0.05, Number(appearance.nmmGain) || 1);
             shader.uniforms.uNmmContrast.value = def.contrast * Math.max(0.2, Number(appearance.nmmContrast) || 1);
+        }
+    }
+    // Cel outline thickness/colour update live (they only touch the separate outline mesh).
+    if (update.celOutline !== undefined || update.celOutlineColor !== undefined) updateCelOutline();
+    // Live look uniforms — cel softness, value-study steps/grey, vibrant punch/sat/temp, cavity
+    // strength/edge — update in place on the cached look material so their sliders drag smoothly.
+    const lm = lookMaterial;
+    if (lm) {
+        if (update.celSoft !== undefined && lm.userData.celSoft)
+            lm.userData.celSoft.value = Math.max(0, Math.min(1, Number(update.celSoft) || 0));
+        if (update.valueSteps !== undefined && lm.userData.valSteps)
+            lm.userData.valSteps.value = Math.max(2, Math.min(8, Number(update.valueSteps) || 4));
+        if (update.valueGray !== undefined && lm.userData.valGray)
+            lm.userData.valGray.value = update.valueGray ? 1 : 0;
+        if (update.vibrancePunch !== undefined && lm.userData.vibPunch)
+            lm.userData.vibPunch.value = Math.max(0, Number(update.vibrancePunch) || 0);
+        if (update.vibranceSat !== undefined && lm.userData.vibSat)
+            lm.userData.vibSat.value = Math.max(0, Number(update.vibranceSat) || 0);
+        if (update.vibranceTemp !== undefined && lm.userData.vibTemp)
+            lm.userData.vibTemp.value = Math.max(0, Number(update.vibranceTemp) || 0);
+        if (lm.uniforms) {
+            if (update.cavityStrength !== undefined && lm.uniforms.uCavity)
+                lm.uniforms.uCavity.value = Math.max(0, Number(update.cavityStrength) || 0);
+            if (update.cavityEdge !== undefined && lm.uniforms.uEdge)
+                lm.uniforms.uEdge.value = Math.max(0, Number(update.cavityEdge) || 0);
         }
     }
     if (Object.keys(update).every(k => LIVE_APPEARANCE_KEYS.has(k))) return;
@@ -1211,10 +1705,10 @@ const CLUSTER_OFFSETS = [
     new THREE.Vector3(-1, 1, -1), new THREE.Vector3(-1, -1, 1)
 ].map(v => v.normalize());
 
-function makePointEmitter(objects, color, candela, decay, size, castShadows = true, mapSize = 512, rankBase = 0) {
+function makePointEmitter(objects, color, candela, decay, size, castShadows = true, mapSize = 512, rankBase = 0, shadowNear = undefined) {
     if (size <= 0) {
         const light = new THREE.PointLight(color, candela, 0, decay);
-        if (castShadows) { configureShadowCaster(light, mapSize); light.userData.shadowRank = rankBase; }
+        if (castShadows) { configureShadowCaster(light, mapSize, shadowNear); light.userData.shadowRank = rankBase; }
         objects.push(light);
         return;
     }
@@ -1230,7 +1724,7 @@ function makePointEmitter(objects, color, candela, decay, size, castShadows = tr
         const light = new THREE.PointLight(color, candela / CLUSTER_OFFSETS.length, 0, decay);
         light.userData.clusterOffset = offset.clone().multiplyScalar(size);
         if (castShadows) {
-            configureShadowCaster(light, Math.min(mapSize, 256), Math.max(2, size * 1.2));
+            configureShadowCaster(light, Math.min(mapSize, 256), Math.max(shadowNear ?? 0, 2, size * 1.2));
             light.shadow.radius = 2 + size * 0.15;
             light.userData.shadowRank = i === 0 ? rankBase : rankBase + 3;
         }
@@ -1248,24 +1742,51 @@ function buildLightObjects(entry) {
         configureShadowCaster(light);
         objects.push(light);
     }
-    else if (entry.farColor) {
-        const dNear = Math.min(4, entry.decay + GRADIENT_NEAR_EXTRA);
-        const dFar = Math.max(0.3, entry.decay - GRADIENT_FAR_LESS);
-        // Equal contribution A at the crossover distance x; the pair totals the slider value at
-        // the reference distance: A = ui / (t^dNear + t^dFar) with t = x/REF, candela = A·x^d.
-        const t = clampGradientStart(entry.gradientStart);
-        const x = t * POINT_REFERENCE_DISTANCE;
-        const A = entry.uiIntensity / (Math.pow(t, dNear) + Math.pow(t, dFar));
-        // BOTH halves cast. The far tint used to skip its cube map ("shares the near light's
-        // position, a second map buys nothing") — but a non-casting light is UNOCCLUDED, so the
-        // far colour poured straight through walls (measured: a gradient light kept 16% of a
-        // plain light's occlusion). Its map rides at 256² and yields first under the caster budget.
-        makePointEmitter(objects, new THREE.Color(entry.color), A * Math.pow(x, dNear), dNear, entry.size, true);
-        makePointEmitter(objects, new THREE.Color(entry.farColor), A * Math.pow(x, dFar), dFar, entry.size, true, 256, 1);
-    }
     else {
-        makePointEmitter(objects, new THREE.Color(entry.color),
-            pointCandela(entry.uiIntensity, entry.decay), entry.decay, entry.size);
+        // Region-anchored lights mount a CONSTELLATION: one emitter set per anchor, intensity
+        // split by each anchor's area share, so a long glowing region (a lava river, a rune
+        // strip) lights its surroundings along its whole shape — while the UI still shows one
+        // light. A glowing region must also never BLOCK its own light: the shadow near plane
+        // starts past the surface push-off, so the emitting surface itself is no occluder
+        // (the same trick sized emitters use against orb-in-hand self-swallowing).
+        const anchors = (entry.regionSource !== null && entry.regionAnchors?.length > 1)
+            ? entry.regionAnchors
+            : [{ offset: null, share: 1 }];
+        // A glow must never shadow ITSELF, so occluders within `shadowNear` of the source are ignored.
+        // Scale that radius to the region's ACTUAL size (a small orb clears a small bubble, so nearby
+        // hair and fingers still cast shadows from it) — with a per-light `shadowGuard` multiplier to
+        // tune the reach: raise it so the hand holding an orb doesn't block its own light, lower it for
+        // tighter occlusion. Rigs saved before this default to guard 1.
+        const autoNear = Math.max(modelRadius * 0.02, (entry.regionRadius ?? modelRadius * 0.12) * REGION_NEAR_K);
+        const shadowNear = entry.regionSource !== null ? autoNear * (entry.shadowGuard ?? 1) : undefined;
+
+        for (const [a, anchor] of anchors.entries()) {
+            const before = objects.length;
+            if (entry.farColor) {
+                const dNear = Math.min(4, entry.decay + GRADIENT_NEAR_EXTRA);
+                const dFar = Math.max(0.3, entry.decay - GRADIENT_FAR_LESS);
+                // Equal contribution A at the crossover distance x; the pair totals the slider
+                // value at the reference distance: A = ui / (t^dNear + t^dFar), candela = A·x^d.
+                const t = clampGradientStart(entry.gradientStart);
+                const x = t * POINT_REFERENCE_DISTANCE;
+                const A = entry.uiIntensity * anchor.share / (Math.pow(t, dNear) + Math.pow(t, dFar));
+                // BOTH halves cast. The far tint used to skip its cube map ("shares the near
+                // light's position, a second map buys nothing") — but a non-casting light is
+                // UNOCCLUDED, so the far colour poured straight through walls (measured: a
+                // gradient light kept 16% of a plain light's occlusion). Its map rides at 256²
+                // and yields first under the caster budget.
+                makePointEmitter(objects, new THREE.Color(entry.color), A * Math.pow(x, dNear), dNear, entry.size, true, 512, a > 0 ? 2 : 0, shadowNear);
+                makePointEmitter(objects, new THREE.Color(entry.farColor), A * Math.pow(x, dFar), dFar, entry.size, true, 256, a > 0 ? 3 : 1, shadowNear);
+            }
+            else {
+                makePointEmitter(objects, new THREE.Color(entry.color),
+                    pointCandela(entry.uiIntensity, entry.decay) * anchor.share, entry.decay, entry.size,
+                    true, 512, a > 0 ? 2 : 0, shadowNear);
+            }
+            if (anchor.offset)
+                for (let j = before; j < objects.length; j++)
+                    objects[j].userData.regionOffset = anchor.offset;
+        }
     }
 
     // Ground bounce (NMM's reflected under-light): light returned by the floor into the
@@ -1302,8 +1823,11 @@ function syncLightPositions(entry) {
             // uniform up-light whose position (hence direction) is fixed.
             if (light.isPointLight) light.position.set(p.x, -modelRadius * 0.3, p.z);
         }
-        else if (light.userData.clusterOffset) light.position.copy(p).add(light.userData.clusterOffset);
-        else light.position.copy(p);
+        else {
+            light.position.copy(p);
+            if (light.userData.regionOffset) light.position.add(light.userData.regionOffset);
+            if (light.userData.clusterOffset) light.position.add(light.userData.clusterOffset);
+        }
     }
     requestShadowUpdate();
 }
@@ -1333,6 +1857,7 @@ function unmountLights(entry) {
 
 export function addLight(type, options) {
     captureUndo('lights', false);
+    invalidate();
     const id = nextLightId++;
 
     // The draggable handle: an unlit glowing ball where the light sits.
@@ -1353,13 +1878,21 @@ export function addLight(type, options) {
         gradientStart: clampGradientStart(options?.gradientStart),
         bounceStrength: Math.min(1, Math.max(0, options?.bounceStrength ?? 0)),
         size: type === 'point' ? Math.min(24, Math.max(0, options?.size ?? 0)) : 0,
+        // How far this light's shadow starts from the source (× its auto size-based near-plane), so a
+        // glow doesn't block its own light — raise for an orb held in a fist, lower for tight occlusion.
+        shadowGuard: type === 'point' ? Math.min(3, Math.max(0, options?.shadowGuard ?? 1)) : 1,
         // A glow-region light is anchored to a painted region: its position/colour derive from the
         // region (recomputed when painting changes) and the region's surface renders emissive.
         regionSource: type === 'point' ? (options?.regionSource ?? null) : null,
         enabled: options?.enabled !== false // switched off but kept: the dimmed handle stays put
     };
     entry.gizmo.scale.setScalar(1 + entry.size / 8); // the handle hints at the source size
-    if (entry.regionSource !== null && options?.x === undefined) anchorRegionLight(entry);
+    // A region light ALWAYS anchors from the mask — the painted area, not a saved x/y/z, is its
+    // source of truth. (Rigs saved before constellation anchoring carry a stale single-point
+    // position; skipping re-anchor on load left them without their anchors and, if the mask had
+    // changed since saving, floating in the wrong place.) If the mask isn't loaded yet this
+    // no-ops and setRegions → refreshRegionLights re-anchors when it arrives.
+    if (entry.regionSource !== null) anchorRegionLight(entry);
     lights.set(id, entry); // register FIRST: mountLights budgets casters across the whole map
     if (entry.enabled) mountLights(entry);
     else entry.lights = [];
@@ -1373,36 +1906,192 @@ export function addLight(type, options) {
 // the region's surface (area-weighted centroid pushed out along the average normal) in the region's
 // colour, and the region itself renders emissive so it reads as the emitter.
 
-/// Recomputes a glow light's position + colour from its region's current painting.
+/// Recomputes a glow light's position + colour from its region's current painting. A region with
+/// spatial EXTENT (a lava river along the base, a winding rune strip) also earns several ANCHOR
+/// points via a small area-weighted k-means over its triangles: the light then mounts as a
+/// constellation along the shape (see buildLightObjects), so the surroundings are lit along the
+/// whole glowing area instead of from one centroid — while the UI still shows ONE light with one
+/// handle, one intensity, one colour.
 function anchorRegionLight(entry) {
     const k = entry.regionSource;
     if (k === null || !regionIndex || !mesh) return false;
     const pos = mesh.geometry.attributes.position;
 
-    let cx = 0, cy = 0, cz = 0, nx = 0, ny = 0, nz = 0, count = 0;
-    for (let t = 0; t < regionIndex.length / 3; t++) {
+    // Area-weighted triangle samples (strided so multi-million-face regions stay cheap).
+    const faceCount = regionIndex.length / 3;
+    const stride = Math.max(1, Math.floor(faceCount / 60000));
+    const sx = [], sy = [], sz = [], sw = [], snx = [], sny = [], snz = [];
+    let cx = 0, cy = 0, cz = 0, nx = 0, ny = 0, nz = 0, totalW = 0;
+    let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (let t = 0; t < faceCount; t += stride) {
         if (regionIndex[t * 3] !== k) continue; // soup: face label = its first vertex's label
         const i = t * 3;
-        cx += (pos.getX(i) + pos.getX(i + 1) + pos.getX(i + 2)) / 3;
-        cy += (pos.getY(i) + pos.getY(i + 1) + pos.getY(i + 2)) / 3;
-        cz += (pos.getZ(i) + pos.getZ(i + 1) + pos.getZ(i + 2)) / 3;
+        const x = (pos.getX(i) + pos.getX(i + 1) + pos.getX(i + 2)) / 3;
+        const y = (pos.getY(i) + pos.getY(i + 1) + pos.getY(i + 2)) / 3;
+        const z = (pos.getZ(i) + pos.getZ(i + 1) + pos.getZ(i + 2)) / 3;
         const ux = pos.getX(i + 1) - pos.getX(i), uy = pos.getY(i + 1) - pos.getY(i), uz = pos.getZ(i + 1) - pos.getZ(i);
         const vx = pos.getX(i + 2) - pos.getX(i), vy = pos.getY(i + 2) - pos.getY(i), vz = pos.getZ(i + 2) - pos.getZ(i);
-        nx += uy * vz - uz * vy; ny += uz * vx - ux * vz; nz += ux * vy - uy * vx;
-        count++;
+        const crx = uy * vz - uz * vy, cry = uz * vx - ux * vz, crz = ux * vy - uy * vx;
+        const w = Math.max(1e-9, Math.hypot(crx, cry, crz)); // 2× triangle area
+        sx.push(x); sy.push(y); sz.push(z); sw.push(w);
+        snx.push(crx); sny.push(cry); snz.push(crz); // area-weighted normal, free from the cross
+        cx += x * w; cy += y * w; cz += z * w;
+        nx += crx; ny += cry; nz += crz;
+        totalW += w;
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
+        if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
     }
-    if (count === 0) return false; // region erased — the light stays where it was
+    if (totalW === 0) return false; // region erased — the light stays where it was
 
-    cx /= count; cy /= count; cz /= count;
+    cx /= totalW; cy /= totalW; cz /= totalW;
     const nLen = Math.hypot(nx, ny, nz) || 1;
     // Push off the surface so the light isn't born inside the mesh (self-shadowed to nothing).
     const off = modelRadius * 0.12;
     entry.gizmo.position.set(cx + (nx / nLen) * off, cy + (ny / nLen) * off, cz + (nz / nLen) * off);
     clampHandle(entry.gizmo.position);
 
+    // How many anchors the extent earns: a compact patch keeps one, an elongated region two,
+    // a sprawling one three. Offsets are stored RELATIVE to the handle, so dragging the handle
+    // moves the whole constellation together.
+    const extent = Math.hypot(maxX - minX, maxY - minY, maxZ - minZ);
+    entry.regionRadius = 0.5 * extent; // the emitter's own size — drives its shadow near-plane
+    const extentAnchors = extent < modelRadius * 0.55 ? 1 : extent < modelRadius * 1.1 ? 2 : 3;
+    // Separate blobs of the same region each deserve their own emitter — take whichever asks for
+    // more (a compact but two-island region still gets 2), capped by the shadow-caster budget.
+    const islands = sx.length >= 8 ? spatialIslands(sx, sy, sz) : 1;
+    const anchorCount = Math.min(MAX_REGION_ANCHORS, Math.max(extentAnchors, islands));
+    entry.regionAnchors = anchorCount <= 1 ? null
+        : clusterRegionAnchors(sx, sy, sz, sw, snx, sny, snz, anchorCount, off, entry.gizmo.position);
+
     const slot = regionPalette[k - 1];
     if (slot) entry.color = slot.color;
     return true;
+}
+
+// Glow-region constellation tuning.
+const MAX_REGION_ANCHORS = 4;   // point-light budget cap per region (each anchor is 1–2 shadow casters)
+const REGION_NEAR_K = 0.28;     // glow shadow near-plane ≈ this × the region's own radius (× per-light shadowGuard)
+const ANCHOR_EVENNESS = 0.6;    // 0 = pure area weighting (small features starve), 1 = every anchor equal
+const ISLAND_GAP = 0.09;        // a gap wider than this (× radius) splits the region into separate emitters
+
+/// How many spatially SEPARATE blobs a region's samples fall into (voxel union-find): a gap wider
+/// than ISLAND_GAP·radius makes two painted areas distinct emitters, so an orb in the hand painted
+/// the same colour as a swirl at the base each earns its own light anchor instead of being averaged
+/// into one. Returns just the count — it drives how many anchors the constellation asks for.
+function spatialIslands(sx, sy, sz) {
+    const n = sx.length;
+    const cell = Math.max(1e-3, modelRadius * ISLAND_GAP);
+    const keyToCell = new Map();
+    const coords = [];
+    const cellOfSample = new Int32Array(n);
+    for (let i = 0; i < n; i++) {
+        const ix = Math.floor(sx[i] / cell), iy = Math.floor(sy[i] / cell), iz = Math.floor(sz[i] / cell);
+        const key = ix + '_' + iy + '_' + iz;
+        let c = keyToCell.get(key);
+        if (c === undefined) { c = coords.length; keyToCell.set(key, c); coords.push([ix, iy, iz]); }
+        cellOfSample[i] = c;
+    }
+    const parent = new Int32Array(coords.length);
+    for (let c = 0; c < parent.length; c++) parent[c] = c;
+    const find = c => { while (parent[c] !== c) { parent[c] = parent[parent[c]]; c = parent[c]; } return c; };
+    for (let c = 0; c < coords.length; c++) {
+        const [ix, iy, iz] = coords[c];
+        for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) {
+            if (dx === 0 && dy === 0 && dz === 0) continue;
+            const nb = keyToCell.get((ix + dx) + '_' + (iy + dy) + '_' + (iz + dz));
+            if (nb !== undefined) { const a = find(c), b = find(nb); if (a !== b) parent[a] = b; }
+        }
+    }
+    const roots = new Set();
+    for (let i = 0; i < n; i++) roots.add(find(cellOfSample[i]));
+    return roots.size;
+}
+
+/// Area-weighted k-means (farthest-point seeded, a few Lloyd rounds) over a region's triangle
+/// samples. Returns [{offset: Vector3 relative to the handle, share}] with shares summing to 1;
+/// clusters under 3% of the area are dropped (a stray brush dot shouldn't earn its own light).
+/// Each anchor pushes off along ITS OWN cluster's average surface normal — pushing "up" buried
+/// anchors inside the mesh on vertical and underside regions, which made the emitted light
+/// inconsistent from cluster to cluster.
+function clusterRegionAnchors(sx, sy, sz, sw, snx, sny, snz, K, surfaceOffset, origin) {
+    const n = sx.length;
+    if (n < K * 4) return null;
+
+    // Seeds: farthest point from the mean, then greedily the point farthest from all seeds.
+    const seedIdx = [];
+    const distToSeeds = new Float32Array(n).fill(Infinity);
+    let mx = 0, my = 0, mz = 0, mw = 0;
+    for (let i = 0; i < n; i++) { mx += sx[i] * sw[i]; my += sy[i] * sw[i]; mz += sz[i] * sw[i]; mw += sw[i]; }
+    mx /= mw; my /= mw; mz /= mw;
+    let best = 0, bestD = -1;
+    for (let i = 0; i < n; i++) {
+        const d = (sx[i] - mx) ** 2 + (sy[i] - my) ** 2 + (sz[i] - mz) ** 2;
+        if (d > bestD) { bestD = d; best = i; }
+    }
+    seedIdx.push(best);
+    while (seedIdx.length < K) {
+        const s = seedIdx[seedIdx.length - 1];
+        best = 0; bestD = -1;
+        for (let i = 0; i < n; i++) {
+            const d = (sx[i] - sx[s]) ** 2 + (sy[i] - sy[s]) ** 2 + (sz[i] - sz[s]) ** 2;
+            if (d < distToSeeds[i]) distToSeeds[i] = d;
+            if (distToSeeds[i] > bestD) { bestD = distToSeeds[i]; best = i; }
+        }
+        seedIdx.push(best);
+    }
+
+    const centers = seedIdx.map(i => [sx[i], sy[i], sz[i]]);
+    const assign = new Int32Array(n);
+    for (let iter = 0; iter < 5; iter++) {
+        for (let i = 0; i < n; i++) {
+            let bi = 0, bd = Infinity;
+            for (let c = 0; c < K; c++) {
+                const d = (sx[i] - centers[c][0]) ** 2 + (sy[i] - centers[c][1]) ** 2 + (sz[i] - centers[c][2]) ** 2;
+                if (d < bd) { bd = d; bi = c; }
+            }
+            assign[i] = bi;
+        }
+        const acc = centers.map(() => [0, 0, 0, 0]);
+        for (let i = 0; i < n; i++) {
+            const a = acc[assign[i]];
+            a[0] += sx[i] * sw[i]; a[1] += sy[i] * sw[i]; a[2] += sz[i] * sw[i]; a[3] += sw[i];
+        }
+        for (let c = 0; c < K; c++)
+            if (acc[c][3] > 0) centers[c] = [acc[c][0] / acc[c][3], acc[c][1] / acc[c][3], acc[c][2] / acc[c][3]];
+    }
+
+    // Shares + per-cluster push-off along each cluster's own average surface normal, exactly
+    // like the single-anchor path — the anchor floats just off ITS patch of surface.
+    const weights = new Array(K).fill(0);
+    const normals = Array.from({ length: K }, () => [0, 0, 0]);
+    for (let i = 0; i < n; i++) {
+        weights[assign[i]] += sw[i];
+        const nAcc = normals[assign[i]];
+        nAcc[0] += snx[i]; nAcc[1] += sny[i]; nAcc[2] += snz[i];
+    }
+    const total = weights.reduce((a, b) => a + b, 0) || 1;
+    const anchors = [];
+    for (let c = 0; c < K; c++) {
+        const share = weights[c] / total;
+        if (share < 0.03) continue;
+        const [cnx, cny, cnz] = normals[c];
+        const nLen = Math.hypot(cnx, cny, cnz) || 1;
+        const px = centers[c][0] + (cnx / nLen) * surfaceOffset;
+        const py = centers[c][1] + (cny / nLen) * surfaceOffset;
+        const pz = centers[c][2] + (cnz / nLen) * surfaceOffset;
+        anchors.push({ offset: new THREE.Vector3(px - origin.x, py - origin.y, pz - origin.z), share });
+    }
+    if (anchors.length < 2) return null;
+    // Even out the per-anchor intensity so a small bright feature sharing a region with a big dim
+    // one still reads: blend each anchor's raw AREA share toward an equal split. Total light is
+    // preserved (the shares still sum to 1) — the big blob just gives some of its intensity to the
+    // small one, instead of a hand-orb starving next to a base swirl in the same region.
+    const evenShare = 1 / anchors.length;
+    for (const a of anchors) a.share = a.share * (1 - ANCHOR_EVENNESS) + evenShare * ANCHOR_EVENNESS;
+    const shareSum = anchors.reduce((a, b) => a + b.share, 0);
+    for (const a of anchors) a.share /= shareSum;
+    return anchors;
 }
 
 /// Re-anchors every glow light and refreshes the emissive flags — called whenever painting,
@@ -1419,6 +2108,17 @@ function refreshRegionLights() {
     }
     if (anyLight) requestShadowUpdate();
     syncGlowingSlots();
+}
+
+/// The emissive gain a glowing region's SURFACE renders at — the same curve the emitter orbs
+/// use (1 + intensity × 1.5, tone-mapped so a hot core rolls off to white), so the painted area
+/// reads as the actual light source at its actual level. 0 = the slot powers no enabled light.
+function glowGainFor(idx) {
+    let gain = 0;
+    for (const entry of lights.values())
+        if (entry.regionSource === idx && entry.enabled)
+            gain = Math.max(gain, 1 + entry.uiIntensity * 1.5);
+    return Math.min(6, gain);
 }
 
 /// Which region slots currently power an ENABLED glow light — those render emissive.
@@ -1466,9 +2166,14 @@ export function updateLight(id, update) {
         entry.size = entry.type === 'point' ? Math.min(24, Math.max(0, update.size)) : 0;
         entry.gizmo.scale.setScalar(1 + entry.size / 8);
     }
+    if (update.shadowGuard !== undefined) entry.shadowGuard = Math.min(3, Math.max(0, update.shadowGuard));
     if (update.enabled !== undefined) { entry.enabled = !!update.enabled; syncGlowingSlots(); }
     if (update.x !== undefined) clampHandle(entry.gizmo.position.set(update.x, update.y, update.z));
     applyLightOrbLook(entry); // colour/intensity/enabled all feed the orb's glow
+
+    // A glow region's SURFACE brightness follows its light's intensity — rebake the encoded
+    // gain (aRegionSurf.w band) so dragging the slider visibly brightens/dims the glow.
+    if (entry.regionSource !== null && update.intensity !== undefined && regionIndex) repaintColors();
 
     // Rebuild rather than mutate: color/decay/gradient changes can change the NUMBER of
     // underlying lights, and ≤4 rig lights make this trivially cheap.
@@ -1512,7 +2217,8 @@ export function cloneLight(id) {
         decay: entry.decay,
         gradientStart: entry.gradientStart,
         bounceStrength: entry.bounceStrength,
-        size: entry.size
+        size: entry.size,
+        shadowGuard: entry.shadowGuard
     });
     selectLight(newId);
     return newId;
@@ -1556,6 +2262,7 @@ export function getLightsJson() {
             gradientStart: entry.gradientStart,
             bounceStrength: entry.bounceStrength,
             size: entry.size,
+            shadowGuard: entry.shadowGuard,
             regionSource: entry.regionSource,
             enabled: entry.enabled,
             selected: id === selectedLightId
@@ -1578,6 +2285,7 @@ function setPointer(event) {
 
 function onPointerDown(event) {
     if (axisControl?.dragging || propControl?.dragging) return; // a gizmo grab owns this gesture
+    if (viewCube?.handlePointerDown(event)) return;             // the corner widget owns its clicks
 
     setPointer(event);
     raycaster.setFromCamera(pointer, camera);
@@ -1587,6 +2295,15 @@ function onPointerDown(event) {
     if (paintMode && mesh && (event.button === 0 || event.button === 2)) {
         const paintHit = raycaster.intersectObject(mesh)[0];
         if (paintHit) {
+            // Lasso: clicks place anchors (or, armed, fill the enclosed area); orbit stays live
+            // off the model. Server round-trips notify the panel themselves.
+            if (brush.mode === 'lasso') {
+                if (lasso && !lasso.busy) {
+                    if (lasso.picking) lassoPick(paintHit.faceIndex, event.button === 2);
+                    else if (event.button === 0) lassoAnchor(mesh.worldToLocal(paintHit.point.clone()));
+                }
+                return;
+            }
             strokeDiff = new Map(); // record pre-stroke region indices so the stroke can be undone
             strokeRegion = event.button === 2 ? 0 : brush.region;
             if (brush.mode === 'fill') {
@@ -1654,12 +2371,14 @@ export function getLightHandlesVisible() {
 /// Shows the X/Y/Z arrows on one light's handle (null hides them).
 export function selectLight(id) {
     selectedLightId = id;
+    invalidate();
     const entry = id !== null ? lights.get(id) : null;
     if (entry) axisControl.attach(entry.gizmo);
     else axisControl.detach();
 }
 
 function onPointerMove(event) {
+    if (viewCube?.handlePointerMove(event)) return;
     // Paint-mode moves are COALESCED to one raycast per rendered frame (processPendingPaint):
     // gaming mice fire 250+ moves/sec, and every one used to raycast a multi-million-triangle
     // mesh — several full-mesh raycasts per frame was most of paint mode's sluggishness.
@@ -1707,7 +2426,8 @@ function processPendingPaint() {
     updateBrushCursor(hit);
 }
 
-function onPointerUp() {
+function onPointerUp(event) {
+    if (viewCube?.handlePointerUp(event)) return;
     if (painting) {
         painting = false;
         controls.enabled = true;
@@ -1758,6 +2478,9 @@ let regionSurfAttr = null;     // per-vertex (use, metalness, roughness) for reg
 let gemFlagAttr = null;        // per-vertex 0/1: fragment shades as a gem (transmission look). Its own
                                // byte — multiplexing it into aRegionSurf.w would make interpolation
                                // at every region border sweep through the gem level and band-glow.
+let translucencyAttr = null;   // per-vertex opacity for TRANSLUCENT regions (1.0 = opaque). Drives a
+                               // screen-door (alpha-hash) discard on the model AND on its shadow, so
+                               // a translucent area shows through and its shadow lightens to match.
 let isolated = -1;             // region highlighted alone; -1 = show all
 let paintGrid = null;          // uniform spatial grid over vertices, so the brush is O(nearby), not O(all)
 let highlightAttr = null;      // per-vertex 0/1 mask (aHighlight) driving the on-model glow overlay
@@ -1791,7 +2514,7 @@ function ensureBrushCursor() {
 /// Lays the brush ring on the surface at a raycast hit (sized to the brush), or hides it when there
 /// is no hit, we're not in paint mode, or the fill tool is active (a radius ring would mislead).
 function updateBrushCursor(hit) {
-    if (!paintMode || !hit || !mesh || brush.mode === 'fill') { if (brushCursor) brushCursor.visible = false; return; }
+    if (!paintMode || !hit || !mesh || brush.mode !== 'brush') { if (brushCursor) brushCursor.visible = false; return; }
     ensureBrushCursor();
     const nrm = (hit.face
         ? hit.face.normal.clone().transformDirection(mesh.matrixWorld)
@@ -1832,7 +2555,30 @@ const REGION_MATERIALS = {
     // gem section of applyRegionSurfacePatch), so only the specular settings matter here: low
     // roughness gives the small sharp light-side sparkle painters put on a stone.
     gem:   { metalness: 0.0, roughness: 0.16 },
+    // Translucent: a glassy/resin/ghost surface you can see through. Low roughness for a sharp
+    // sheen; the see-through itself comes from the per-region opacity (screen-door), not here.
+    translucent: { metalness: 0.0, roughness: 0.22 },
 };
+
+// A translucent region never goes FULLY invisible (you'd lose the shape) — this is the opacity floor.
+const TRANSLUCENT_MIN = 0.05;
+const TRANSLUCENT_DEFAULT = 0.5;
+
+// How translucent areas render: true = smooth GLASS (real per-region transmission — the physical
+// look shows the environment through it), false = FROSTED (screen-door stipple). Either way the
+// dithered shadow-caster keeps the shadow lightening. Global preference, saved with the rig.
+let glassSmooth = true;
+
+function hasTranslucentRegion() {
+    return regionPalette.some(r => r?.material === 'translucent');
+}
+
+/// Per-vertex opacity a slot contributes to aTranslucency: its opacity if translucent, else 1
+/// (opaque). At a region border the byte interpolates toward the neighbour, softening the edge.
+function translucencyValue(slot) {
+    if (slot?.material !== 'translucent') return 1.0;
+    return Math.min(1, Math.max(TRANSLUCENT_MIN, slot.opacity ?? TRANSLUCENT_DEFAULT));
+}
 
 // (materialUse, metalness, roughness, tintUse) in [0,1] for the normalized aRegionSurf attribute —
 // the setters convert to bytes themselves (BufferAttribute normalize-on-set). EVERY painted vertex
@@ -1842,8 +2588,11 @@ function surfFor(idx) {
     if (idx <= 0) return [0, 0, 0, 0];
     const slot = regionPalette[idx - 1];
     const m = slot ? REGION_MATERIALS[slot.material] : undefined;
-    // w: 0 = unpainted, 0.6 = tinted, 1.0 = tinted + EMISSIVE (the region powers a glow light).
-    const w = glowingSlots.has(idx) ? 1.0 : 0.6;
+    // w: 0 = unpainted, 0.6 = tinted, 0.86–1.0 = tinted + EMISSIVE with the glow light's gain
+    // encoded into the band (0.86 → 0, 1.0 → 6): the region surface IS the source, so its
+    // brightness must track the light's intensity, not a fixed constant.
+    const gain = glowGainFor(idx);
+    const w = gain > 0 ? 0.86 + (gain / 6) * 0.14 : 0.6;
     if (!m) return [0, 0, 0, w];
     // Per-slot fine-tune: an explicit metalness/roughness on the slot overrides the preset's
     // values (the presets become starting points). Rides in the palette, so it saves with the mask.
@@ -1861,6 +2610,18 @@ function surfFor(idx) {
 // Only PBR materials get the patch — matcap/toon are fixed stylized references by design.
 // ---------------------------------------------------------------------------------------------
 function applyRegionSurfacePatch(material, useTint) {
+    // Two translucency looks, both keeping the dithered shadow (via the shadow-caster material):
+    //  • GLASS (smooth): real per-region transmission — only on a physical material, and only when a
+    //    translucent region exists, so opaque scenes never trigger the extra transmission pass.
+    //  • FROSTED: screen-door (alpha-hash) — a stable per-pixel discard at coverage = aTranslucency,
+    //    in the opaque pass (no transparency sorting on a single mesh).
+    const smoothGlass = glassSmooth && !!material.isMeshPhysicalMaterial;
+    material.alphaHash = !smoothGlass;
+    if (smoothGlass && hasTranslucentRegion()) {
+        material.transmission = 1.0;   // per-fragment scaled to (1 - opacity) in the shader below
+        material.ior = 1.35;
+        material.thickness = Math.max(1, modelRadius * 0.25);
+    }
     const prevCompile = material.onBeforeCompile;
     material.onBeforeCompile = shader => {
         if (prevCompile) prevCompile(shader);
@@ -1868,18 +2629,31 @@ function applyRegionSurfacePatch(material, useTint) {
         shader.vertexShader = shader.vertexShader.replace('void main() {',
             'attribute vec4 aRegionSurf;\nvarying vec4 vRegionSurf;\n' +
             'attribute vec3 aGemFlag;\nvarying vec3 vGemParams;\n' +
+            'attribute float aTranslucency;\nvarying float vTranslucency;\n' +
             (useTint ? 'attribute vec3 color;\nvarying vec3 vRegionTint;\n' : '') +
-            'void main() {\n  vRegionSurf = aRegionSurf;\n  vGemParams = aGemFlag;' +
+            'void main() {\n  vRegionSurf = aRegionSurf;\n  vGemParams = aGemFlag;\n  vTranslucency = aTranslucency;' +
             (useTint ? '\n  vRegionTint = color;' : ''));
 
         // Varyings go at the very TOP of the fragment source (not at void main): the gem term
         // below lives inside RE_Direct_Physical, a pars function defined before main, and GLSL
         // resolves names in file order.
         shader.fragmentShader =
-            'varying vec4 vRegionSurf;\nvarying vec3 vGemParams;\n' +
+            'varying vec4 vRegionSurf;\nvarying vec3 vGemParams;\nvarying float vTranslucency;\n' +
             (useTint ? 'varying vec3 vRegionTint;\n' : '') +
             shader.fragmentShader;
         material.userData.regionShader = shader;
+
+        if (smoothGlass) {
+            // Smooth glass: scale the material's transmission per fragment to (1 - opacity), so
+            // opaque regions (vTranslucency = 1) transmit nothing and translucent ones show through.
+            // (The replace no-ops when transmission is off — no translucent region — so it's safe.)
+            shader.fragmentShader = shader.fragmentShader.replace('#include <transmissionmap_fragment>',
+                '#include <transmissionmap_fragment>\n\tmaterial.transmission *= ( 1.0 - vTranslucency );');
+        } else {
+            // Frosted: feed the per-region opacity into the alpha-hash test (alphaHash is on).
+            shader.fragmentShader = shader.fragmentShader.replace('#include <alphahash_fragment>',
+                'diffuseColor.a = vTranslucency;\n#include <alphahash_fragment>');
+        }
 
         // The factor assignments live inside unexpanded #includes — expand and patch them, as the
         // lock-specular patch does for the lights chunk.
@@ -1920,15 +2694,28 @@ function applyRegionSurfacePatch(material, useTint) {
             .replace('#include <color_fragment>',
                 '#include <color_fragment>\n\tdiffuseColor.rgb = mix( diffuseColor.rgb, vRegionTint, step( 0.3, vRegionSurf.w ) );')
             // Glow-region surfaces emit their own colour, so the source area reads hot under ACES
-            // instead of a passive tint. (w: 0 none, 0.6 tint, 1.0 tint + emissive.)
+            // instead of a passive tint. (w: 0 none, 0.6 tint, 0.86–1.0 tint + emissive whose
+            // gain is encoded in the band — the surface glows at its light's actual level.)
             .replace('#include <emissivemap_fragment>',
-                '#include <emissivemap_fragment>\n\ttotalEmissiveRadiance += vRegionTint * ( step( 0.85, vRegionSurf.w ) * 1.4 );');
+                '#include <emissivemap_fragment>\n\ttotalEmissiveRadiance += vRegionTint * ( step( 0.85, vRegionSurf.w ) * ( vRegionSurf.w - 0.86 ) / 0.14 * 6.0 );');
     };
     const prevKey = material.customProgramCacheKey;
     material.customProgramCacheKey = () =>
-        (prevKey ? prevKey.call(material) : '') + '|regionsurf-gem' + (useTint ? '+tint' : '');
+        (prevKey ? prevKey.call(material) : '') + '|regionsurf-gem' + (useTint ? '+tint' : '') +
+        (smoothGlass ? '+glass' : '+frost');
     return material;
 }
+
+/// Global toggle for how translucent areas render: smooth glass (real transmission) vs frosted
+/// (screen-door). Rebuilds the lit look so the new path compiles; the shadow lightening is
+/// unaffected (its dither runs regardless).
+export function setGlassSmooth(on) {
+    glassSmooth = !!on;
+    invalidate();
+    if (mesh && !paintMode) rebuildLookMaterial();
+}
+
+export function getGlassSmooth() { return glassSmooth; }
 
 function buildRegionColors() {
     return [NEUTRAL, ...regionPalette.map(r => new THREE.Color(r.color))];
@@ -1939,6 +2726,7 @@ function resetRegions() {
     regionColorAttr = null;
     regionSurfAttr = null;
     gemFlagAttr = null;
+    translucencyAttr = null;
     paintGrid = null;
     fillTopology = null; // adjacency belongs to the old geometry
     highlightAttr = null;
@@ -2056,22 +2844,51 @@ function ensureRegionBuffers() {
     gemFlagAttr = new THREE.BufferAttribute(new Uint8Array(count * 3), 3, true);
     gemFlagAttr.setUsage(THREE.DynamicDrawUsage);
     mesh.geometry.setAttribute('aGemFlag', gemFlagAttr);
+    // Per-vertex opacity (1.0 = opaque). Filled with 255 so untouched geometry stays solid — a
+    // zero-filled default would make the whole model, and its shadow, vanish.
+    translucencyAttr = new THREE.BufferAttribute(new Uint8Array(count).fill(255), 1, true);
+    translucencyAttr.setUsage(THREE.DynamicDrawUsage);
+    mesh.geometry.setAttribute('aTranslucency', translucencyAttr);
+    // Shadow-caster materials that thin a translucent region's shadow: they dither-discard depth at
+    // coverage = opacity, so ~opacity of the fragments occlude and the shadow lightens to match the
+    // model. Depth for directional/spot lights, distance for point lights.
+    mesh.customDepthMaterial = makeShadowDitherMaterial(new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking }));
+    mesh.customDistanceMaterial = makeShadowDitherMaterial(new THREE.MeshDistanceMaterial());
+}
+
+/// A shadow-caster material (depth or distance) that discards translucent fragments with a stable
+/// hash at coverage = aTranslucency, so the shadow they cast is proportionally lighter.
+function makeShadowDitherMaterial(material) {
+    material.onBeforeCompile = shader => {
+        shader.vertexShader = shader.vertexShader.replace('void main() {',
+            'attribute float aTranslucency;\nvarying float vTranslucency;\nvoid main() {\n\tvTranslucency = aTranslucency;');
+        shader.fragmentShader = 'varying float vTranslucency;\n' +
+            'float _transHash(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }\n' +
+            shader.fragmentShader.replace('void main() {',
+                'void main() {\n\tif ( vTranslucency < 0.996 && _transHash(gl_FragCoord.xy) > vTranslucency ) discard;');
+    };
+    material.customProgramCacheKey = () => 'chromatory-shadow-dither-' + material.type;
+    return material;
 }
 
 // Encode/decode ranges for the gem attribute — the GLSL decode in applyRegionSurfacePatch MUST
-// match: power spans [0.2, 4.0], gain spans [0, 6].
+// match: power spans [0.2, 4.0], gain spans [0, 6]. Window/glow are PER REGION: a slot without
+// its own values gets the fixed defaults, never a global — one stone's setting can't bleed
+// into another (or follow whatever rig was loaded last).
 function gemEncode(slot) {
     if (slot?.material !== 'gem') return [0, 0, 0];
-    const power = Math.min(4, Math.max(0.2, slot.gemPower ?? gemParams.power));
-    const gain = Math.min(6, Math.max(0, slot.gemGain ?? gemParams.gain));
+    const power = Math.min(4, Math.max(0.2, slot.gemPower ?? 1.35));
+    const gain = Math.min(6, Math.max(0, slot.gemGain ?? 2.4));
     return [1, (power - 0.2) / 3.8, gain / 6];
 }
 
 function repaintColors() {
     if (!regionColorAttr) return;
+    invalidate();
     // Palette lookups hoisted: this loops over every vertex of a multi-million-vertex print.
     const surf = regionPalette.map((_, k) => surfFor(k + 1));
     const gems = regionPalette.map(r => gemEncode(r));
+    const trans = regionPalette.map(r => translucencyValue(r));
     const noGem = [0, 0, 0];
     for (let i = 0; i < regionIndex.length; i++) {
         const idx = regionIndex[i];
@@ -2081,10 +2898,12 @@ function repaintColors() {
         regionSurfAttr.setXYZW(i, s[0], s[1], s[2], s[3]);
         const g = idx > 0 ? (gems[idx - 1] ?? noGem) : noGem;
         gemFlagAttr.setXYZ(i, g[0], g[1], g[2]);
+        translucencyAttr.setX(i, idx > 0 ? (trans[idx - 1] ?? 1.0) : 1.0);
     }
     regionColorAttr.needsUpdate = true;
     regionSurfAttr.needsUpdate = true;
     gemFlagAttr.needsUpdate = true;
+    translucencyAttr.needsUpdate = true;
 }
 
 function paintAt(worldPoint) {
@@ -2099,6 +2918,7 @@ function paintAt(worldPoint) {
     const c = regionThreeColors[paintR] ?? NEUTRAL;
     const s = surfFor(paintR); // the region's own surface (or none), baked alongside its colour
     const gemVals = paintR > 0 ? gemEncode(regionPalette[paintR - 1]) : [0, 0, 0]; // gem params ride per-stroke too
+    const transVal = paintR > 0 ? translucencyValue(regionPalette[paintR - 1]) : 1.0;
     const highlightVal = paintR === isolated ? 1 : 0; // keep an active glow in sync with new paint
 
     const g = paintGrid, bb = g.bb;
@@ -2120,6 +2940,7 @@ function paintAt(worldPoint) {
                 regionColorAttr.setXYZ(i, c.r, c.g, c.b);
                 regionSurfAttr.setXYZW(i, s[0], s[1], s[2], s[3]);
                 gemFlagAttr.setXYZ(i, gemVals[0], gemVals[1], gemVals[2]);
+                translucencyAttr.setX(i, transVal);
                 if (highlightAttr) highlightAttr.setX(i, highlightVal);
             }
         }
@@ -2127,6 +2948,7 @@ function paintAt(worldPoint) {
     regionColorAttr.needsUpdate = true;
     regionSurfAttr.needsUpdate = true;
     gemFlagAttr.needsUpdate = true;
+    translucencyAttr.needsUpdate = true;
     if (highlightAttr && isolated >= 0) highlightAttr.needsUpdate = true;
 }
 
@@ -2257,6 +3079,8 @@ function fillFromFace(seedFace) {
     const paintR = strokeRegion;
     const c = regionThreeColors[paintR] ?? NEUTRAL;
     const s = surfFor(paintR);
+    const gemVals = paintR > 0 ? gemEncode(regionPalette[paintR - 1]) : [0, 0, 0];
+    const transVal = paintR > 0 ? translucencyValue(regionPalette[paintR - 1]) : 1.0;
     const highlightVal = paintR === isolated ? 1 : 0;
     const list = fillTopology.fillList;
 
@@ -2268,12 +3092,16 @@ function fillFromFace(seedFace) {
             regionIndex[i] = paintR;
             regionColorAttr.setXYZ(i, c.r, c.g, c.b);
             regionSurfAttr.setXYZW(i, s[0], s[1], s[2], s[3]);
+            gemFlagAttr.setXYZ(i, gemVals[0], gemVals[1], gemVals[2]);
+            translucencyAttr.setX(i, transVal);
             if (highlightAttr) highlightAttr.setX(i, highlightVal);
         }
     }
 
     regionColorAttr.needsUpdate = true;
     regionSurfAttr.needsUpdate = true;
+    gemFlagAttr.needsUpdate = true;
+    translucencyAttr.needsUpdate = true;
     if (highlightAttr && isolated >= 0) highlightAttr.needsUpdate = true;
     regionsDirty = true;
     return count;
@@ -2340,10 +3168,487 @@ export function __debugFill(faceIndex, region, angleDeg) {
     return fillFromFace(faceIndex | 0);
 }
 
+/// Raycasts a NORMALIZED image point (0–1, top-left origin — the coordinate system a vision model
+/// reads off a render) onto the model as seen from captureAngles' view i-of-n (viewIndex 0 = the
+/// current camera). Reproduces that view's azimuth, casts, and RESTORES the camera. Returns the
+/// raw THREE intersection (with .point in world space and .faceIndex), or null on a miss.
+function raycastImagePoint(nx, ny, viewIndex = 0, viewCount = 1) {
+    if (!mesh || !camera) return null;
+    const target = controls.target.clone();
+    const savedPos = camera.position.clone();
+    if (viewIndex > 0 && viewCount > 1) {
+        const offset = savedPos.clone().sub(target);
+        const az = Math.atan2(offset.x, offset.z) + (viewIndex / viewCount) * Math.PI * 2;
+        const horiz = Math.hypot(offset.x, offset.z);
+        camera.position.set(target.x + horiz * Math.sin(az), target.y + offset.y, target.z + horiz * Math.cos(az));
+        camera.lookAt(target);
+        camera.updateMatrixWorld();
+    }
+    raycaster.setFromCamera(new THREE.Vector2(nx * 2 - 1, -(ny * 2 - 1)), camera);
+    const hit = raycaster.intersectObject(mesh)[0] ?? null;
+    camera.position.copy(savedPos);
+    camera.lookAt(target);
+    controls.update();
+    return hit;
+}
+
+/// Vision-driven painting (the paint_region tool): raycast through a NORMALIZED image point as
+/// seen from captureAngles' view i-of-n (so points given on ANY rendered angle aim correctly),
+/// then flood-fill the hit area into a region (the same click-to-fill the interactive studio
+/// uses). Returns JSON {hit, faceIndex?, filledFaces?}.
+export function fillAtImagePoint(nx, ny, region, angleDeg, viewIndex = 0, viewCount = 1, maxFaces = 0) {
+    if (!mesh || !camera) return JSON.stringify({ hit: false, error: 'no model loaded' });
+    ensureRegionBuffers();
+
+    const hit = raycastImagePoint(nx, ny, viewIndex, viewCount);
+    if (!hit || hit.faceIndex === undefined || hit.faceIndex === null)
+        return JSON.stringify({ hit: false });
+    strokeRegion = region | 0;
+    brush.fillAngle = angleDeg;
+    // With a face budget, record prior values so an oversized fill can roll back — a fill far
+    // bigger than the aimed feature means the ray hit the wrong surface (parallax) or leaked
+    // across a soft boundary, and applying it would wreck neighbouring areas.
+    strokeDiff = maxFaces > 0 ? new Map() : null;
+    const filledFaces = fillFromFace(hit.faceIndex);
+    let rejected = false;
+    if (maxFaces > 0 && filledFaces > maxFaces) {
+        for (const [i, prev] of strokeDiff) regionIndex[i] = prev;
+        repaintColors();
+        refreshRegionLights();
+        rejected = true;
+    }
+    strokeDiff = null;
+    return JSON.stringify({ hit: true, faceIndex: hit.faceIndex, filledFaces, rejected });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Lasso select — crease-following region selection, the scissor cut's painting sibling. The user
+// clicks points on the surface; the service (MeshScissor sessions, the same /assembly/scissor/*
+// endpoints assembly cuts use) routes each leg along the SHARPEST creases between clicks, and once
+// lines enclose an area, one click inside floods it into the current paint slot. All geometry
+// stays on the service (project rule: never heavy geometry in browser JS); the canvas uploads the
+// mesh once, places anchors and draws polylines. The upload is the CURRENT geometry re-exported
+// as STL, so client and server always agree on triangle order and coordinate space — face indices
+// in the reply drop straight into the paint mask, and reorienting the model (which bakes into the
+// positions) simply ends the session.
+// ---------------------------------------------------------------------------------------------
+
+let lasso = null; // { sessionId, urlBase, headerName, headerValue, overlay, chains:[{markers,lines,closed}], pendingNewChain, picking, busy, lastFill, error }
+
+const lassoChain = () => lasso.chains[lasso.chains.length - 1];
+const lassoAnchorTotal = () => lasso ? lasso.chains.reduce((sum, c) => sum + c.markers.length, 0) : 0;
+const lassoLegCount = () => lasso ? lasso.chains.reduce((sum, c) => sum + c.lines.length, 0) : 0;
+
+async function lassoPost(path, body) {
+    const response = await fetch(`${lasso.urlBase}/${path}`, {
+        method: 'POST',
+        headers: { [lasso.headerName]: lasso.headerValue, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    });
+    if (!response.ok) {
+        let reason = `${response.status}`;
+        try { reason = (await response.json()).detail ?? reason; } catch { }
+        throw new Error(reason);
+    }
+    return await response.json();
+}
+
+/// The current model geometry as binary STL — positions exactly as rendered (centered, Y-up,
+/// scaled, any orientation baked), triangle order untouched, so the service builds its crease
+/// graph over the very mesh the paint mask indexes.
+function exportStudioStl() {
+    const pos = mesh.geometry.attributes.position;
+    const triCount = pos.count / 3;
+    const buffer = new ArrayBuffer(84 + triCount * 50);
+    const out = new Uint8Array(buffer);
+    out.set(new TextEncoder().encode('Chromatory studio'), 0);
+    new DataView(buffer).setUint32(80, triCount, true);
+    const scratch = new Float32Array(12);
+    const scratchBytes = new Uint8Array(scratch.buffer, 0, 48);
+    const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+    const ab = new THREE.Vector3(), ac = new THREE.Vector3(), n = new THREE.Vector3();
+    let offset = 84;
+    for (let t = 0; t < triCount; t++) {
+        a.fromBufferAttribute(pos, t * 3);
+        b.fromBufferAttribute(pos, t * 3 + 1);
+        c.fromBufferAttribute(pos, t * 3 + 2);
+        n.copy(ab.subVectors(b, a)).cross(ac.subVectors(c, a)).normalize();
+        scratch[0] = n.x; scratch[1] = n.y; scratch[2] = n.z;
+        scratch[3] = a.x; scratch[4] = a.y; scratch[5] = a.z;
+        scratch[6] = b.x; scratch[7] = b.y; scratch[8] = b.z;
+        scratch[9] = c.x; scratch[10] = c.y; scratch[11] = c.z;
+        out.set(scratchBytes, offset);
+        offset += 50;
+    }
+    return out;
+}
+
+/// Starts a lasso session: uploads the mesh once (the expensive weld + crease-graph build runs
+/// server-side), then clicks place anchors. Returns a JSON status for the panel.
+export async function enterLasso(urlBase, headerName, headerValue, direct) {
+    if (!mesh) return JSON.stringify({ ok: false, reason: 'no model loaded' });
+    if (lasso) exitLasso();
+    try {
+        const response = await fetch(`${urlBase}/begin${direct ? '?direct=true' : ''}`, {
+            method: 'POST',
+            headers: { [headerName]: headerValue, 'Content-Type': 'application/octet-stream' },
+            body: exportStudioStl()
+        });
+        if (!response.ok) throw new Error(`${response.status}`);
+        const result = await response.json();
+        const overlay = new THREE.Group();
+        mesh.add(overlay); // geometry-space coords; transforms are baked into positions, so this is 1:1
+        lasso = {
+            sessionId: result.sessionId, urlBase, headerName, headerValue,
+            overlay, chains: [], pendingNewChain: false, picking: false, busy: false,
+            lastFill: 0, error: ''
+        };
+        return JSON.stringify({ ok: true });
+    }
+    catch (error) {
+        return JSON.stringify({ ok: false, reason: error.message });
+    }
+}
+
+export function exitLasso() {
+    if (!lasso) return;
+    mesh?.remove(lasso.overlay);
+    lasso.overlay.traverse(o => { o.geometry?.dispose?.(); o.material?.dispose?.(); });
+    fetch(`${lasso.urlBase}/${lasso.sessionId}`, {
+        method: 'DELETE', headers: { [lasso.headerName]: lasso.headerValue }
+    }).catch(() => { });
+    lasso = null;
+}
+
+function lassoAddMarker(localPoint, first) {
+    const marker = new THREE.Mesh(
+        new THREE.SphereGeometry(modelRadius * 0.012, 12, 12),
+        new THREE.MeshBasicMaterial({ color: first ? 0xffe640 : 0x2fe6c8, depthTest: false, toneMapped: false }));
+    marker.position.copy(localPoint);
+    marker.renderOrder = 30;
+    lasso.overlay.add(marker);
+    lassoChain().markers.push(marker);
+}
+
+function lassoAddLine(points) {
+    const geometry = new THREE.BufferGeometry().setFromPoints(
+        points.map(p => new THREE.Vector3(p[0], p[1], p[2])));
+    const line = new THREE.Line(geometry,
+        new THREE.LineBasicMaterial({ color: 0x2fe6c8, depthTest: false, toneMapped: false }));
+    line.renderOrder = 29;
+    lasso.overlay.add(line);
+    lassoChain().lines.push(line);
+}
+
+/// Places one anchor (LOCAL/geometry-space point) and draws the crease-snapped leg to it.
+async function lassoAnchor(localPoint) {
+    if (lasso.busy) return;
+    lasso.busy = true;
+    lasso.error = '';
+    try {
+        const result = await lassoPost('anchor', {
+            sessionId: lasso.sessionId, x: localPoint.x, y: localPoint.y, z: localPoint.z,
+            newChain: lasso.pendingNewChain
+        });
+        lasso.pendingNewChain = false;
+        if (result.startsChain || lasso.chains.length === 0)
+            lasso.chains.push({ markers: [], lines: [], closed: false });
+        lassoAddMarker(new THREE.Vector3(...result.anchor), lassoChain().markers.length === 0);
+        if (result.polyline) lassoAddLine(result.polyline);
+    }
+    catch (error) { lasso.error = error.message; }
+    finally { lasso.busy = false; notifyChanged(); }
+}
+
+/// Routes from the current line's last anchor back to its first, completing a loop.
+export async function lassoClose() {
+    if (!lasso || lasso.busy) return JSON.stringify({ ok: false });
+    lasso.busy = true;
+    lasso.error = '';
+    try {
+        const result = await lassoPost('close', { sessionId: lasso.sessionId });
+        if (result.polyline) lassoAddLine(result.polyline);
+        lassoChain().closed = true;
+        lasso.pendingNewChain = true; // a closed loop is complete — clicking again starts a new line
+        return JSON.stringify({ ok: true });
+    }
+    catch (error) {
+        lasso.error = error.message;
+        return JSON.stringify({ ok: false, reason: error.message });
+    }
+    finally { lasso.busy = false; notifyChanged(); }
+}
+
+/// The next click starts a SEPARATE line — a band around an arm needs a loop at each end.
+export function lassoNewLine() {
+    if (!lasso) return;
+    lasso.pendingNewChain = true;
+    lasso.picking = false;
+    notifyChanged();
+}
+
+/// true: the next click FILLS the enclosed area under it (right-click erases); false: back to
+/// placing points.
+export function lassoArmPick(on) {
+    if (!lasso) return;
+    lasso.picking = !!on;
+    notifyChanged();
+}
+
+/// Removes the last step of the current line, mirroring the server's bookkeeping exactly:
+/// a closed loop reopens (the synthetic closing leg goes, markers stay), an open line loses
+/// its last anchor + leg, an emptied line disappears.
+function lassoPopStep() {
+    const chain = lassoChain();
+    if (!chain) return;
+    if (chain.closed) {
+        const line = chain.lines.pop();
+        if (line) lasso.overlay.remove(line);
+        chain.closed = false;
+    } else {
+        const marker = chain.markers.pop();
+        if (marker) lasso.overlay.remove(marker);
+        if (chain.lines.length > Math.max(0, chain.markers.length - 1)) {
+            const line = chain.lines.pop();
+            if (line) lasso.overlay.remove(line);
+        }
+        if (chain.markers.length === 0) lasso.chains.pop();
+    }
+    lasso.pendingNewChain = false; // resume the line the undo landed on
+}
+
+export async function lassoUndo() {
+    if (!lasso || lasso.busy || lasso.chains.length === 0) return JSON.stringify({ ok: false });
+    lasso.busy = true;
+    lasso.error = '';
+    try {
+        await lassoPost('undo', { sessionId: lasso.sessionId });
+        lassoPopStep();
+        return JSON.stringify({ ok: true });
+    }
+    catch (error) { return JSON.stringify({ ok: false, reason: error.message }); }
+    finally { lasso.busy = false; notifyChanged(); }
+}
+
+/// Clears every drawn line (the session and its crease graph stay warm).
+export async function lassoClearLines() {
+    if (!lasso || lasso.busy) return JSON.stringify({ ok: false });
+    lasso.busy = true;
+    lasso.error = '';
+    try {
+        for (let guard = 0; lasso.chains.length > 0 && guard < 400; guard++) {
+            await lassoPost('undo', { sessionId: lasso.sessionId });
+            lassoPopStep();
+        }
+        return JSON.stringify({ ok: true });
+    }
+    catch (error) { return JSON.stringify({ ok: false, reason: error.message }); }
+    finally { lasso.busy = false; notifyChanged(); }
+}
+
+/// Click inside the drawn lines: the service floods the enclosed faces (walls = every drawn
+/// line) and the whole area lands in the region in ONE undoable step, gem params and all.
+async function lassoPick(faceIndex, erase, restrictTo) {
+    if (lasso.busy || faceIndex === undefined || faceIndex === null) return;
+    lasso.busy = true;
+    lasso.error = '';
+    try {
+        const result = await lassoPost('component', { sessionId: lasso.sessionId, face: faceIndex });
+        // If the walled flood is no smaller than the free flood from the same seed, the lines
+        // didn't carve anything off — the fill escaped (an open loop, or a gap where a point
+        // missed the surface). Applying it would dump paint across the whole connected area.
+        if (result.count >= result.unboundedCount) {
+            lasso.error = "that fills the WHOLE connected area — the lines don't close a loop around that spot";
+            return;
+        }
+        lasso.lastFill = lassoApplyFaces(result.faces, erase ? 0 : brush.region, restrictTo);
+    }
+    catch (error) { lasso.error = error.message; }
+    finally { lasso.busy = false; notifyChanged(); }
+}
+
+/// Lays a base64 face bit mask (LSB-first, triangle order) into the paint mask as one stroke —
+/// the same per-vertex writes the brush makes, so colour, surface, gem params and any active
+/// highlight all stay consistent, and one Ctrl+Z restores every touched vertex.
+function lassoApplyFaces(base64, region, restrictTo) {
+    ensureRegionBuffers();
+    const bytes = Uint8Array.from(atob(base64), ch => ch.charCodeAt(0));
+    const c = regionThreeColors[region] ?? NEUTRAL;
+    const s = surfFor(region);
+    const gemVals = region > 0 ? gemEncode(regionPalette[region - 1]) : [0, 0, 0];
+    const highlightVal = region === isolated ? 1 : 0;
+    const diff = new Map();
+    const triCount = mesh.geometry.attributes.position.count / 3;
+    let applied = 0;
+    const clamp = restrictTo !== undefined && restrictTo !== null;
+    for (let t = 0; t < triCount; t++) {
+        if (!(bytes[t >> 3] & (1 << (t & 7)))) continue;
+        // Parent-region clamp: a SPLIT only moves faces out of the named parent region, so a fence
+        // that overruns can never grab a neighbour (skin, the base) — those faces are left alone.
+        if (clamp && regionIndex[t * 3] !== restrictTo) continue;
+        applied++;
+        for (let k = 0; k < 3; k++) {
+            const i = t * 3 + k;
+            if (!diff.has(i)) diff.set(i, regionIndex[i]);
+            regionIndex[i] = region;
+            regionColorAttr.setXYZ(i, c.r, c.g, c.b);
+            regionSurfAttr.setXYZW(i, s[0], s[1], s[2], s[3]);
+            gemFlagAttr.setXYZ(i, gemVals[0], gemVals[1], gemVals[2]);
+            if (highlightAttr) highlightAttr.setX(i, highlightVal);
+        }
+    }
+    regionColorAttr.needsUpdate = true;
+    regionSurfAttr.needsUpdate = true;
+    gemFlagAttr.needsUpdate = true;
+    if (highlightAttr && isolated >= 0) highlightAttr.needsUpdate = true;
+    regionsDirty = true;
+    pushPaintUndo(diff);
+    return applied;
+}
+
+export function lassoState() {
+    const chain = lasso && lasso.chains.length > 0 ? lassoChain() : null;
+    return JSON.stringify({
+        active: lasso !== null,
+        busy: lasso?.busy ?? false,
+        picking: lasso?.picking ?? false,
+        anchors: lassoAnchorTotal(),
+        chainAnchors: chain?.markers.length ?? 0,
+        chainClosed: chain?.closed ?? false,
+        lines: lasso?.chains.length ?? 0,
+        legs: lassoLegCount(),
+        closedLoops: lasso?.chains.filter(ch => ch.closed).length ?? 0,
+        lastFill: lasso?.lastFill ?? 0,
+        error: lasso?.error ?? ''
+    });
+}
+
+/// Dev/tuning hooks: drive the lasso outside the pointer pipeline (geometry-space coords).
+export async function __debugLassoAnchor(x, y, z, newChain = false) {
+    if (!lasso) return lassoState();
+    if (newChain) lasso.pendingNewChain = true;
+    await lassoAnchor(new THREE.Vector3(x, y, z));
+    return lassoState();
+}
+
+export async function __debugLassoPick(faceIndex, erase = false) {
+    if (lasso) await lassoPick(faceIndex | 0, !!erase);
+    return lassoState();
+}
+
+/// Resolves the palette slot by name (case-insensitive) or creates it with the given colour /
+/// material; returns the 1-based region index. Shared by the vision paint + lasso paths.
+function resolveSlotIndex(name, color, material) {
+    const lower = (name ?? '').toLowerCase();
+    let index = regionPalette.findIndex(p => (p.name ?? '').toLowerCase() === lower);
+    const pal = regionPalette.map(r => ({ ...r }));
+    if (index < 0) {
+        pal.push({ name, color: color || '#c84f4f', material: material || 'look' });
+        index = pal.length - 1;
+        setRegionPalette(JSON.stringify(pal));
+    } else if (color || material) {
+        if (color) pal[index].color = color;
+        if (material) pal[index].material = material;
+        setRegionPalette(JSON.stringify(pal));
+    }
+    return index + 1;
+}
+
+/// Vision-driven LASSO painting (paint_region's outline mode): the caller AIMS outline points on
+/// a render (normalized 0–1 image coords + viewIndex); the service snaps each leg to the sharpest
+/// crease between them (the same sessions the interactive lasso uses), the loop closes, and one
+/// INSIDE point floods the enclosed area into the slot as one undoable stroke. Preview-first:
+/// nothing is saved — the caller reads the mask back and persists it only on an explicit save.
+/// args (JSON): { slotName, slotColor?, slotMaterial?, outline:[{x,y,viewIndex?}], inside:{x,y,viewIndex?},
+///                viewCount?, close?, erase? }
+export async function lassoPaintAtImagePoints(urlBase, headerName, headerValue, argsJson) {
+    const args = typeof argsJson === 'string' ? JSON.parse(argsJson) : argsJson;
+    if (!mesh || !camera) return JSON.stringify({ ok: false, error: 'no model loaded' });
+    ensureRegionBuffers();
+
+    const viewCount = Math.max(1, args.viewCount | 0 || 1);
+    const region = resolveSlotIndex(args.slotName, args.slotColor, args.slotMaterial);
+
+    // Optional parent-region clamp — a SPLIT carves a sub-part OUT of an existing region, so the fill
+    // only ever moves that parent's faces (a fence that overruns can't grab skin or the base).
+    let restrictTo = null;
+    if (args.withinSlot) {
+        const idx = regionPalette.findIndex(p => (p.name ?? '').toLowerCase() === String(args.withinSlot).toLowerCase());
+        if (idx < 0)
+            return JSON.stringify({ ok: false, error: `withinSlot region "${args.withinSlot}" not found — split from an existing region` });
+        restrictTo = idx + 1;
+    }
+
+    // Aim the outline points onto the surface — each becomes a geometry-local anchor. A point that
+    // misses is reported (it would leave a gap the flood escapes through), not silently dropped.
+    const anchors = [];
+    const misses = [];
+    (args.outline ?? []).forEach((p, i) => {
+        const hit = raycastImagePoint(p.x, p.y, p.viewIndex ?? 0, viewCount);
+        if (!hit) misses.push(i);
+        else anchors.push(mesh.worldToLocal(hit.point.clone()));
+    });
+    if (anchors.length < 2)
+        return JSON.stringify({ ok: false, error: 'fewer than 2 outline points landed on the surface', misses });
+    // A missed point is a GAP in the outline — the fill would leak through it across a large area.
+    // Refuse rather than paint garbage; the caller re-aims the listed points (0-based indices).
+    if (misses.length > 0)
+        return JSON.stringify({ ok: false,
+            error: `${misses.length} outline point(s) missed the surface — re-aim them onto the model (a gap lets the fill leak)`,
+            misses });
+
+    const enter = JSON.parse(await enterLasso(urlBase, headerName, headerValue, args.directFence === true));
+    if (!enter.ok) return JSON.stringify({ ok: false, error: enter.reason ?? 'could not start the lasso session' });
+
+    const savedBrushRegion = brush.region;
+    brush.region = region; // lassoPick paints into brush.region
+    let result;
+    try {
+        const legErrors = [];
+        for (const a of anchors) {
+            await lassoAnchor(a);
+            if (lasso.error) legErrors.push(lasso.error);
+        }
+        if (args.close !== false) {
+            await lassoClose();
+            if (lasso.error) legErrors.push(lasso.error);
+        }
+
+        let filledFaces = 0, escaped = false, fillError = '';
+        const hit = args.inside
+            ? raycastImagePoint(args.inside.x, args.inside.y, args.inside.viewIndex ?? 0, viewCount)
+            : null;
+        if (!args.inside) {
+            fillError = 'no inside point given — provide one point inside the outline to fill';
+        } else if (!hit || hit.faceIndex == null) {
+            fillError = 'the inside point missed the surface';
+        } else {
+            await lassoPick(hit.faceIndex, args.erase === true, restrictTo);
+            filledFaces = lasso.lastFill;
+            fillError = lasso.error || '';
+            escaped = fillError.includes('WHOLE'); // the flood leaked past the lines
+        }
+
+        const st = JSON.parse(lassoState());
+        result = {
+            ok: true, region, slot: regionPalette[region - 1],
+            anchorsPlaced: anchors.length, misses,
+            lines: st.lines, closedLoops: st.closedLoops,
+            filledFaces, escaped,
+            error: fillError || legErrors[legErrors.length - 1] || ''
+        };
+    } finally {
+        brush.region = savedBrushRegion;
+        exitLasso(); // fill lives in the mask; drop the overlay + free the session before capture
+    }
+    return JSON.stringify(result);
+}
+
 /// Enter/leave paint mode. Paint mode swaps to a LIT vertex-colour material — so the model keeps its
 /// shape and surface detail while the coloured regions tint it — rather than a flat unlit fill.
 export function setPaintMode(on) {
     paintMode = !!on;
+    invalidate();
     if (!mesh) return;
     if (paintMode) {
         ensureRegionBuffers();
@@ -2358,11 +3663,13 @@ export function setPaintMode(on) {
         mesh.material = ensurePaintMaterial();
     } else {
         // Keep any active region glow — showing it on the LIT model is the whole point.
+        exitLasso(); // leaving paint mode ends the selection session (lines are paint-time UI)
         if (brushCursor) brushCursor.visible = false;
         hideFillPreview();
         mesh.material = lookMaterial ?? rebuildLookMaterial(); // swap, don't rebuild — the program stays warm
         refreshRegionLights(); // painting may have moved/recoloured a glow light's region
     }
+    updateCelOutline(); // the inked outline belongs to the lit cel look, not the flat paint view
 }
 
 export function getPaintMode() { return paintMode; }
@@ -2370,17 +3677,17 @@ export function getPaintMode() { return paintMode; }
 export function setBrush(opts) {
     if (opts.region !== undefined) brush.region = opts.region | 0;
     if (opts.radius !== undefined) brush.radius = Math.max(0.005, Math.min(0.4, opts.radius)); // floor low enough for edge cleanup
-    if (opts.mode !== undefined) brush.mode = opts.mode === 'fill' ? 'fill' : 'brush';
+    if (opts.mode !== undefined)
+        brush.mode = opts.mode === 'fill' || opts.mode === 'lasso' ? opts.mode : 'brush';
     if (opts.fillAngle !== undefined) {
         brush.fillAngle = Math.max(1, Math.min(90, opts.fillAngle));
         fillPreview.angle = -1;                                   // slider moved: preview is stale
         if (lastPaintHover) pendingPaintMove = lastPaintHover;    // refresh without a mouse move
     }
-    if (brush.mode === 'fill') {
-        if (brushCursor) brushCursor.visible = false; // the ring is brush-sized; misleading for fill
-    } else {
-        hideFillPreview();
+    if (brush.mode !== 'brush') {
+        if (brushCursor) brushCursor.visible = false; // the ring is brush-sized; misleading for fill/lasso
     }
+    if (brush.mode !== 'fill') hideFillPreview();
 }
 
 /// Glow one region in place on whatever's showing (works on the LIT look, not just the flat view).
@@ -2642,6 +3949,7 @@ export function getSetup() {
         floor: { color: floorColor },
         shadows: shadowsEnabled,
         shadowTint: { color: shadowTintColor, strength: shadowStrength },
+        glassSmooth,
         specularLock: { on: specLock.on, position: specLock.camPos.toArray() },
         ambient: {
             intensity: ambientLevel,
@@ -2657,7 +3965,9 @@ export function applySetup(json) {
     captureUndo('load', false);
     const setup = JSON.parse(json);
     withUndoSuppressed(() => {
-        if (setup.appearance) setAppearance(setup.appearance);
+        // Set BEFORE the look material is (re)built so the translucency path compiles correctly.
+        if (setup.glassSmooth !== undefined) glassSmooth = !!setup.glassSmooth;
+        if (setup.appearance) { migrateLegacyFill(setup.appearance); setAppearance(setup.appearance); }
         if (setup.ambient) setEnvironmentLight(setup.ambient); // v1 rigs simply keep the default
         if (setup.floor) setFloor(setup.floor);
         if (setup.shadows !== undefined) setShadows(setup.shadows);
@@ -2764,6 +4074,8 @@ export function captureAngles(count = 4) {
         camera.position.set(target.x + horiz * Math.sin(az), target.y + y, target.z + horiz * Math.cos(az));
         camera.lookAt(target);
         camera.updateMatrixWorld();
+        camera.matrixWorldInverse.copy(camera.matrixWorld).invert(); // render() would, but sync reads it first
+        syncStudioUniforms(); // per-angle: view-locked highlights + frozen ink must track each view
         shots.push(screenshot());
     }
     camera.position.copy(savedPos);

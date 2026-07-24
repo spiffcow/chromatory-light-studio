@@ -14,7 +14,17 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Chromatory — Light Studio</title>
+    <title>Chromatory Light Studio · free NMM &amp; OSL preview for miniature painters</title>
+    <meta name="description" content="Light your own STL in the browser: preview NMM and OSL with real cast shadows, paint regions, save lighting rigs. Free, no account, and your model is never uploaded." />
+    <link rel="canonical" href="https://spiffcow.github.io/chromatory-light-studio/" />
+    <meta property="og:title" content="Chromatory Light Studio" />
+    <meta property="og:description" content="Preview NMM and OSL on your own STL with real cast shadows, free in your browser. Nothing is uploaded." />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://spiffcow.github.io/chromatory-light-studio/" />
+    <meta property="og:image" content="https://chromatory.com/assets/studio-price-of-magic.png" />
+    <meta property="og:image:alt" content="The Price of Magic (sculpted by Nerikson) rendered with NMM and OSL in Chromatory's Light Studio" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:image" content="https://chromatory.com/assets/studio-price-of-magic.png" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <script type="importmap">{ "imports": { "three": "./lib/three/three.module.js" } }</script>
     <!-- The SAME stylesheet the Chromatory app uses (copied from the source tree by the deploy
@@ -46,6 +56,7 @@
                  border-radius: 8px; padding: 8px 14px; margin: 10px 0 4px; font-size: 14px; }
         footer { margin-top: 24px; }
     </style>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "c2c420b32a274aa7bb811e3d350df2cc"}'></script>
 </head>
 <body>
 <div class="studio-layout">
@@ -90,16 +101,22 @@
 
 <div class="studio-panel">
 
+<div class="row" id="advancedRow" style="display:none;justify-content:flex-end;margin-bottom:4px">
+    <label class="muted small" title="Show the deeper tuning controls: material fine-tune, shadow colour, and per-light falloff, size and bounce. Off keeps the panel simple.">
+        <input type="checkbox" id="advanced" /> ⚙ Advanced controls
+    </label>
+</div>
+
 <details class="card section" open>
     <summary>🎨 Look</summary>
-    <div class="muted small">Responds to your lights:</div>
+    <div class="muted small" id="renderModeLabel" style="display:none">Render mode (how the model is displayed):</div>
+    <div class="row" id="render-modes" style="display:none"></div>
+    <div class="muted small">Material (what the surface is):</div>
     <div class="row" id="looks-live"></div>
-    <div class="muted small">Fixed idealized reference (ignores lights — the shapes to copy):</div>
-    <div class="row" id="looks-fixed"></div>
     <div class="row">
         <label>Color <input type="color" id="color" value="#c8ccd2" /></label>
-        <label id="bandsRow" style="display:none">Bands <input type="range" id="bands" min="2" max="8" step="1" value="4" /></label>
     </div>
+    <div class="row" id="renderModeControls"></div>
     <div class="row" id="pbrRow">
         <label>Metal <input type="range" id="metal" min="0" max="1" step="0.05" value="1" /></label>
         <label>Rough <input type="range" id="rough" min="0.02" max="1" step="0.02" value="0.3" /></label>
@@ -163,6 +180,12 @@
         <button class="ghost" id="addRegion" style="margin-top:6px">+ Add area</button>
     </details>
     <div class="row" id="lightUpRow" style="display:none"></div>
+    <div class="row" id="glowRow" style="display:none">
+        <span class="muted small">Glow light:</span>
+        <select id="glowRegionPick" style="max-width:150px"></select>
+        <button class="ghost" id="addGlowLight"
+                title="A light whose SOURCE is the chosen painted area — it sits just off the area, glows in its colour, and the area itself renders emissive at the light's level (lava, runes, a glowing blade)">✨ + Glow region</button>
+    </div>
     <div class="row">
         <button id="saveRegions">💾 Save areas…</button>
         <button id="loadRegions">📂 Load areas</button>
@@ -227,7 +250,10 @@
     // assembly: links the Assembly workbench (Pro/Dev; published under /assembly/ by the script).
     // multiStl: the Scene section — add extra STLs as movable props to light a composed scene.
     // gemFinish: the Gem region material (inverted transmission look) — early-access first.
-    const FEATURES = { regions: true, assembly: true, multiStl: true, gemFinish: false };
+    // glowRegion: a painted area becomes a light source (lava, runes) — early-access first.
+    // renderModes: the render-style picker (Cel / Value study / Vibrant) — early-access first.
+    // advancedControls: the ⚙ toggle that keeps the panel simple by default — early-access first.
+    const FEATURES = { regions: true, assembly: false, multiStl: true, gemFinish: false, glowRegion: false, renderModes: false, advancedControls: false };
 
     const $ = id => document.getElementById(id);
     const status = $('loadstatus');
@@ -265,22 +291,28 @@
         loadFile(event.dataTransfer.files[0]);
     });
 
-    // ---- Looks (single source: studio.LOOKS)
+    // ---- Looks: material (studio.LOOKS) x render mode (studio.RENDER_MODES), two independent axes.
     let currentLook = 'silvernmm';
-    const appearance = { shader: 'pbr', matcap: 'chrome', toonBands: 4, color: '#c8ccd2',
+    let currentRenderMode = 'realistic';
+    // Advanced-controls preference (parity with the app's ⚙ toggle). On the stable build the feature
+    // is off and everything shows, exactly as the standalone always did; on the early-access build the
+    // toggle appears, the panel starts simple, and the choice is remembered per browser.
+    let advanced = FEATURES.advancedControls ? localStorage.getItem('chromatory-studio-advanced') === '1' : true;
+    const appearance = { shader: 'pbr', renderMode: 'realistic', matcap: 'chrome', toonBands: 4, color: '#c8ccd2',
         metalness: 1.0, roughness: 0.3, clearcoat: 0, envIntensity: 0.75 };
 
     function renderLookButtons() {
-        for (const [host, fixed] of [[$('looks-live'), false], [$('looks-fixed'), true]]) {
-            host.innerHTML = '';
-            for (const [key, look] of Object.entries(studio.LOOKS)) {
-                if (look.fixedReference !== fixed) continue;
-                const button = document.createElement('button');
-                button.textContent = look.label;
-                button.className = key === currentLook ? 'active' : '';
-                button.addEventListener('click', () => applyLook(key));
-                host.appendChild(button);
-            }
+        const host = $('looks-live');
+        host.innerHTML = '';
+        // Only the light-responsive materials; the fixed idealized matcaps now live in RENDER_MODES
+        // and, like the app, stay hidden (UiFlags.ReferenceRenderModes / FixedMetalMatcaps are off).
+        for (const [key, look] of Object.entries(studio.LOOKS)) {
+            if (look.fixedReference) continue;
+            const button = document.createElement('button');
+            button.textContent = look.label;
+            button.className = key === currentLook ? 'active' : '';
+            button.addEventListener('click', () => applyLook(key));
+            host.appendChild(button);
         }
     }
 
@@ -291,23 +323,74 @@
         appearance.color = $('color').value;
         $('metal').value = appearance.metalness ?? 1;
         $('rough').value = appearance.roughness ?? 0.3;
-        $('bands').value = appearance.toonBands ?? 4;
-        $('bandsRow').style.display = appearance.shader === 'toon' ? '' : 'none';
-        $('pbrRow').style.display = appearance.shader === 'pbr' ? '' : 'none';
+        $('pbrRow').style.display = (appearance.shader === 'pbr' && advanced) ? '' : 'none';
         studio.setAppearance(appearance);
         renderLookButtons();
         syncLockButton();
+    }
+
+    // Render mode is the second Look axis — it composes WITH the chosen material (a cel-shaded gloss
+    // differs from cel-shaded matte). Only the lit modes; the fixed reference matcaps stay app-only.
+    function renderRenderModeButtons() {
+        const host = $('render-modes');
+        host.innerHTML = '';
+        for (const [key, mode] of Object.entries(studio.RENDER_MODES)) {
+            if (mode.fixedReference) continue;
+            const button = document.createElement('button');
+            button.textContent = mode.label;
+            button.className = key === currentRenderMode ? 'active' : '';
+            button.addEventListener('click', () => applyRenderMode(key));
+            host.appendChild(button);
+        }
+    }
+    function applyRenderMode(key) {
+        currentRenderMode = key;
+        appearance.renderMode = key;
+        studio.setAppearance(appearance);
+        renderRenderModeButtons();
+        renderRenderModeControls();
+    }
+
+    // Per-render-mode controls, generated from the SHARED schema (studio.RENDER_MODE_CONTROLS) so the
+    // standalone and the app expose the exact same set / ranges / defaults / labels. Each widget writes
+    // its appearance field and re-pushes; `when:'specLocked'` rows show only while highlights are frozen.
+    function renderRenderModeControls() {
+        const host = $('renderModeControls');
+        host.innerHTML = '';
+        if (!FEATURES.renderModes) return; // render modes are advance-only on the standalone for now
+        const controls = (studio.RENDER_MODE_CONTROLS || {})[currentRenderMode] || [];
+        const locked = studio.getSpecularLock();
+        for (const c of controls) {
+            if (c.when === 'specLocked' && !locked) continue;
+            const value = appearance[c.field] ?? c.default;
+            const label = document.createElement('label');
+            label.className = 'small';
+            if (c.title) label.title = c.title;
+            const input = document.createElement('input');
+            input.type = c.type;
+            if (c.type === 'range') { input.min = c.min; input.max = c.max; input.step = c.step; input.value = value; }
+            else if (c.type === 'checkbox') { input.checked = !!value; }
+            else if (c.type === 'color') { input.value = value; input.style.cssText = 'width:30px;height:26px;padding:0;border:none;background:none;cursor:pointer'; }
+            if (c.type === 'checkbox') label.append(input, ' ' + c.label);
+            else label.append(c.label + ' ', input);
+            input.addEventListener(c.type === 'range' ? 'input' : 'change', () => {
+                appearance[c.field] = c.type === 'checkbox' ? input.checked
+                    : c.type === 'color' ? input.value
+                    : (c.int ? parseInt(input.value, 10) : parseFloat(input.value));
+                studio.setAppearance(appearance);
+            });
+            host.appendChild(label);
+        }
     }
 
     function pushAppearance() {
         appearance.color = $('color').value;
         appearance.metalness = parseFloat($('metal').value);
         appearance.roughness = parseFloat($('rough').value);
-        appearance.toonBands = parseInt($('bands').value, 10);
         appearance.lookKey = currentLook; // rides into saved rigs so a load re-highlights the look
         studio.setAppearance(appearance);
     }
-    for (const id of ['color', 'metal', 'rough', 'bands']) $(id).addEventListener('input', pushAppearance);
+    for (const id of ['color', 'metal', 'rough']) $(id).addEventListener('input', pushAppearance);
 
     // After a rig load (or Ctrl+Z) the ENGINE holds the restored appearance — mirror it back into
     // the panel instead of letting stale inputs stomp it on the next touch.
@@ -315,13 +398,14 @@
         const a = JSON.parse(studio.getAppearanceJson());
         Object.assign(appearance, a);
         if (a.lookKey && studio.LOOKS[a.lookKey]) currentLook = a.lookKey;
+        if (a.renderMode) currentRenderMode = a.renderMode;
         if (a.color) $('color').value = a.color;
         $('metal').value = a.metalness ?? 1;
         $('rough').value = a.roughness ?? 0.3;
-        $('bands').value = a.toonBands ?? 4;
-        $('bandsRow').style.display = a.shader === 'toon' ? '' : 'none';
-        $('pbrRow').style.display = a.shader === 'pbr' ? '' : 'none';
+        $('pbrRow').style.display = (a.shader === 'pbr' && advanced) ? '' : 'none';
         renderLookButtons();
+        renderRenderModeButtons();
+        renderRenderModeControls();
     }
 
     // ---- Lights
@@ -332,7 +416,10 @@
         for (const light of list) {
             const card = document.createElement('div');
             card.className = light.selected ? 'card selected' : 'card';
-            const gradient = light.type === 'point' ? `
+            // Falloff / far-tint gradient, source size and floor-bounce are the per-light ADVANCED
+            // controls (parity with the app's ⚙ toggle): in simple mode a light shows just its colour,
+            // brightness and the on / clone / remove buttons.
+            const gradient = (advanced && light.type === 'point') ? `
                 <div class="row">
                     <label>Falloff <input type="range" data-id="${light.id}" data-k="decay" min="0.5" max="3" step="0.1" value="${light.decay}"
                         title="how fast it dims with distance — high for candles, low for lanterns"></label>
@@ -345,14 +432,14 @@
             const sizeControl = light.type === 'point' ? `
                     <label>Size <input type="range" data-id="${light.id}" data-k="size" min="0" max="24" step="1" value="${light.size}"
                         title="physical size of the source — bigger gives broader highlights and softer shadow edges"></label>` : '';
-            const bounceRow = `
+            const bounceRow = advanced ? `
                 <div class="row">
                     ${sizeControl}
                     <label><input type="checkbox" data-id="${light.id}" data-k="bounceOn" ${light.bounceStrength > 0 ? 'checked' : ''}> Bounce</label>
                     ${light.bounceStrength > 0 ? `
                         <input type="range" data-id="${light.id}" data-k="bounceStrength" min="0.05" max="1" step="0.05" value="${light.bounceStrength}"
                             title="how much bounces back up off the floor — the secondary NMM highlight (tinted by the Floor colour)">` : ''}
-                </div>`;
+                </div>` : '';
             card.innerHTML = `
                 <div class="row spread">
                     <span class="muted small" data-id="${light.id}" data-k="select" style="cursor:pointer"
@@ -524,7 +611,9 @@
 
             const name = document.createElement('input');
             name.type = 'text'; name.value = slot.name; name.style.maxWidth = '150px';
-            name.addEventListener('input', () => { palette[i].name = name.value; pushPalette(); });
+            // Commit on blur/Enter, NOT on every keystroke: pushPalette() rebuilds this list, which
+            // would replace the input mid-type and drop focus after each character.
+            name.addEventListener('change', () => { palette[i].name = name.value; pushPalette(); });
 
             const material = document.createElement('select');
             material.title = 'How this area reflects light — metal gleams, matte stays flat' +
@@ -572,6 +661,21 @@
         row.innerHTML = '';
         const painted = palette.map((_, i) => i + 1).filter(idx => (counts[idx] ?? 0) > 0);
         row.style.display = painted.length ? '' : 'none';
+
+        // Glow-region light picker follows the same painted-slot list.
+        if (FEATURES.glowRegion) {
+            $('glowRow').style.display = painted.length ? '' : 'none';
+            const pick = $('glowRegionPick');
+            const previous = pick.value;
+            pick.innerHTML = '';
+            for (const idx of painted) {
+                const option = document.createElement('option');
+                option.value = idx;
+                option.textContent = palette[idx - 1].name;
+                pick.appendChild(option);
+            }
+            if ([...pick.options].some(o => o.value === previous)) pick.value = previous;
+        }
         if (!painted.length) { if (highlighted !== -1) { highlighted = -1; studio.showAllRegions(); } return; }
         const label = document.createElement('span');
         label.className = 'muted small'; label.textContent = 'Light up:';
@@ -650,10 +754,22 @@
         });
         // A finished brush stroke / fill changes the painted counts — refresh the "Light up" row.
         $('canvas').addEventListener('pointerup', () => { if (painting) renderLightUp(); });
+
+        if (FEATURES.glowRegion) {
+            $('addGlowLight').addEventListener('click', () => {
+                const idx = parseInt($('glowRegionPick').value, 10);
+                if (!idx) return;
+                // Same recipe as the app: a fast-falloff point light anchored to the region; the
+                // engine positions it off the area's centroid and renders the area emissive.
+                studio.addLight('point', { regionSource: idx, intensity: 1.4, decay: 2.2 });
+                refreshLights();
+            });
+        }
     }
 
     function syncShadowRow() {
-        $('shadowTintRow').style.display = $('shadows').checked ? '' : 'none';
+        // Shadow colour / strength is an advanced tuning control (parity with the app).
+        $('shadowTintRow').style.display = ($('shadows').checked && advanced) ? '' : 'none';
     }
     const pushShadowTint = () => studio.setShadowTint({
         color: $('shadowTint').value, strength: parseFloat($('shadowStrength').value) });
@@ -667,6 +783,7 @@
         const locked = studio.getSpecularLock();
         $('lockSpec').textContent = locked ? '🔒 Highlights locked' : '🔒 Lock highlights';
         $('lockSpec').className = locked ? 'active' : 'ghost';
+        renderRenderModeControls(); // the "Mark line" rows apply only while highlights are frozen
     }
     $('lockSpec').addEventListener('click', () => {
         studio.setSpecularLock(!studio.getSpecularLock());
@@ -735,14 +852,38 @@
     // engine state, same set as after loading a rig.
     studio.setChangeCallback(syncEngineControls);
 
+    // ⚙ Advanced controls — mirrors the app's toggle. Hidden entirely on the stable build (feature
+    // off → `advanced` is forced true so everything shows, unchanged). On early access the panel
+    // starts simple and re-renders the gated controls when toggled, remembering the choice per browser.
+    function applyAdvanced() {
+        $('pbrRow').style.display = (appearance.shader === 'pbr' && advanced) ? '' : 'none';
+        syncShadowRow();
+        refreshLights();
+    }
+    if (FEATURES.advancedControls) {
+        $('advancedRow').style.display = '';
+        $('advanced').checked = advanced;
+        $('advanced').addEventListener('change', () => {
+            advanced = $('advanced').checked;
+            try { localStorage.setItem('chromatory-studio-advanced', advanced ? '1' : '0'); } catch { /* private mode: preference just won't persist */ }
+            applyAdvanced();
+        });
+    }
+
     applyLook('silvernmm');
+    if (FEATURES.renderModes) {
+        $('render-modes').style.display = '';
+        $('renderModeLabel').style.display = '';
+        renderRenderModeButtons();
+        renderRenderModeControls();
+    }
     refreshLights();
     refreshProps();
     syncShadowRow();
     if (FEATURES.regions) { loadPalette(); renderPalette(); renderLightUp(); }
 
     // News badge: highlighted until the news page for this version has been opened once.
-    if (localStorage.getItem('pb-news-seen') !== '2026-07-17') $('newsLink').classList.add('unread');
+    if (localStorage.getItem('pb-news-seen') !== '2026-07-23') $('newsLink').classList.add('unread');
 
     // First visit: load the sample bust (CC0) so the page demonstrates itself — replaced the
     // moment the visitor drops their own STL. Fetched after init so the UI paints first.
