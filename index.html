@@ -71,8 +71,7 @@
         · <a href="https://discord.gg/UExX6gPhwM" target="_blank" rel="noopener">💬 Discord</a>
         · <a href="news.html" id="newsLink">🔔 News</a> · <a href="terms.html">Terms</a></p>
     <div id="promo">See more on <a href="https://www.chromatory.com/" target="_blank"
-        rel="noopener">www.chromatory.com</a> or <a href="https://www.patreon.com/cw/Chromatory/membership"
-        target="_blank" rel="noopener">support me on Patreon</a> ❤️</div>
+        rel="noopener">www.chromatory.com</a> ❤️</div>
 </header>
 
 <div class="studio-grid">
@@ -131,6 +130,7 @@
         <button data-preset="candle">Candle-low (fire gradient)</button>
         <button class="ghost" id="addPoint">+ Point</button>
         <button class="ghost" id="addDir">+ Directional</button>
+        <button class="ghost" id="addDark" title="Radiates DARKNESS instead of light — pulls nearby surfaces toward its colour (void creatures, necrotic gems, dark OSL). Hide the handle with 'Light source dots'.">☾ Dark source</button>
     </div>
     <div class="row">
         <label>Ambient <input type="range" id="ambient" min="0" max="0.8" step="0.02" value="0.18" /></label>
@@ -253,7 +253,8 @@
     // glowRegion: a painted area becomes a light source (lava, runes) — early-access first.
     // renderModes: the render-style picker (Cel / Value study / Vibrant) — early-access first.
     // advancedControls: the ⚙ toggle that keeps the panel simple by default — early-access first.
-    const FEATURES = { regions: true, assembly: false, multiStl: true, gemFinish: false, glowRegion: false, renderModes: false, advancedControls: false };
+    // darkSource: the ☾ dark source that radiates darkness (negative light) — early-access first.
+    const FEATURES = { regions: true, assembly: true, multiStl: true, gemFinish: true, glowRegion: true, renderModes: true, advancedControls: true, darkSource: true };
 
     const $ = id => document.getElementById(id);
     const status = $('loadstatus');
@@ -262,6 +263,7 @@
     $('assemblyLink').style.display = FEATURES.assembly ? '' : 'none';
     $('sceneSection').style.display = FEATURES.multiStl ? '' : 'none';
     $('regionsSection').style.display = FEATURES.regions ? '' : 'none';
+    $('addDark').style.display = FEATURES.darkSource ? '' : 'none';
 
     // ---- STL loading (file picker + drag & drop, no size limit — it never leaves the client)
     async function loadFile(file) {
@@ -419,7 +421,7 @@
             // Falloff / far-tint gradient, source size and floor-bounce are the per-light ADVANCED
             // controls (parity with the app's ⚙ toggle): in simple mode a light shows just its colour,
             // brightness and the on / clone / remove buttons.
-            const gradient = (advanced && light.type === 'point') ? `
+            const gradient = (advanced && light.type === 'point' && !light.dark) ? `
                 <div class="row">
                     <label>Falloff <input type="range" data-id="${light.id}" data-k="decay" min="0.5" max="3" step="0.1" value="${light.decay}"
                         title="how fast it dims with distance — high for candles, low for lanterns"></label>
@@ -432,7 +434,7 @@
             const sizeControl = light.type === 'point' ? `
                     <label>Size <input type="range" data-id="${light.id}" data-k="size" min="0" max="24" step="1" value="${light.size}"
                         title="physical size of the source — bigger gives broader highlights and softer shadow edges"></label>` : '';
-            const bounceRow = advanced ? `
+            const bounceRow = (advanced && !light.dark) ? `
                 <div class="row">
                     ${sizeControl}
                     <label><input type="checkbox" data-id="${light.id}" data-k="bounceOn" ${light.bounceStrength > 0 ? 'checked' : ''}> Bounce</label>
@@ -440,10 +442,18 @@
                         <input type="range" data-id="${light.id}" data-k="bounceStrength" min="0.05" max="1" step="0.05" value="${light.bounceStrength}"
                             title="how much bounces back up off the floor — the secondary NMM highlight (tinted by the Floor colour)">` : ''}
                 </div>` : '';
+            // A dark source: reach + facing wrap (its colour + brightness above are the darkness tint + strength).
+            const darkRow = light.dark ? `
+                <div class="row">
+                    <label>Radius <input type="range" data-id="${light.id}" data-k="darkRange" min="20" max="400" step="5" value="${light.darkRange}"
+                        title="how far the darkness reaches out from the source"></label>
+                    <label>Wrap <input type="range" data-id="${light.id}" data-k="darkWrap" min="0" max="1" step="0.05" value="${light.darkWrap}"
+                        title="0 = an even sphere of gloom; 1 = only surfaces turned toward the source darken (inverse OSL)"></label>
+                </div>` : '';
             card.innerHTML = `
                 <div class="row spread">
                     <span class="muted small" data-id="${light.id}" data-k="select" style="cursor:pointer"
-                        title="select this light in the view (shows its move arrows)">${light.selected ? '▶ ' : ''}${light.type} light</span>
+                        title="select this light in the view (shows its move arrows)">${light.selected ? '▶ ' : ''}${light.dark ? '☾ dark source' : light.type + ' light'}</span>
                     <div class="row">
                         <input type="color" data-id="${light.id}" data-k="color" value="${light.color}">
                         <input type="range" data-id="${light.id}" data-k="intensity" min="0" max="4" step="0.1" value="${light.intensity}" title="Brightness">
@@ -452,7 +462,7 @@
                         <button class="ghost" data-id="${light.id}" data-k="clone" title="duplicate this light with all its settings">⧉</button>
                         <button class="ghost" data-id="${light.id}" data-k="remove" title="remove (or select it and press Delete)">✕</button>
                     </div>
-                </div>${gradient}${bounceRow}`;
+                </div>${darkRow}${gradient}${bounceRow}`;
             host.appendChild(card);
         }
         host.querySelectorAll('[data-k]').forEach(el => {
@@ -502,6 +512,7 @@
         button.addEventListener('click', () => { studio.applyPreset(button.dataset.preset); refreshLights(); }));
     $('addPoint').addEventListener('click', () => { studio.addLight('point', {}); refreshLights(); });
     $('addDir').addEventListener('click', () => { studio.addLight('directional', {}); refreshLights(); });
+    $('addDark').addEventListener('click', () => { studio.addLight('point', { dark: true }); refreshLights(); });
     $('ambient').addEventListener('input', () => studio.setEnvironmentLight({ intensity: parseFloat($('ambient').value) }));
     $('floor').addEventListener('input', () => studio.setFloor({ color: $('floor').value }));
     $('shadows').addEventListener('change', () => { studio.setShadows($('shadows').checked); syncShadowRow(); });
@@ -883,7 +894,7 @@
     if (FEATURES.regions) { loadPalette(); renderPalette(); renderLightUp(); }
 
     // News badge: highlighted until the news page for this version has been opened once.
-    if (localStorage.getItem('pb-news-seen') !== '2026-07-23') $('newsLink').classList.add('unread');
+    if (localStorage.getItem('pb-news-seen') !== '2026-07-25') $('newsLink').classList.add('unread');
 
     // First visit: load the sample bust (CC0) so the page demonstrates itself — replaced the
     // moment the visitor drops their own STL. Fetched after init so the UI paints first.

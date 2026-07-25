@@ -1317,6 +1317,7 @@ let shadowTintColor = '#000000';
 let shadowStrength = 1.0;
 
 const _lockedCamView = new THREE.Vector3();
+const _darkView = new THREE.Vector3();
 
 // Frozen "where to mark" ink: the two world-space silhouette directions captured when the lock
 // engages (the locked view direction and its azimuth-flip). Drives the cel material's contour.
@@ -1327,6 +1328,23 @@ const _inkVert = new THREE.Vector3();
 const _inkHoriz = new THREE.Vector3();
 const _inkOrigin = new THREE.Vector3();
 
+// Subtractive "dark source" term: each enabled dark light mixes the lit surface toward its darkness
+// colour, by view-space distance (a soft falloff inside its radius) and an optional facing "wrap"
+// (0 = a sphere of gloom, 1 = only surfaces turned toward the source darken — inverse OSL). Runs after
+// lighting, before tonemapping, where `normal` (view space) and vViewPosition are still in scope.
+const DARK_FRAGMENT = `
+  {
+    vec3 fragViewPos = -vViewPosition;
+    for (int di = 0; di < 4; di++) {
+      if (di >= uDarkCount) break;
+      vec3 toDark = uDarkPosView[di] - fragViewPos;
+      float atten = clamp(1.0 - length(toDark) / max(uDarkParams[di].y, 0.0001), 0.0, 1.0);
+      atten *= atten;
+      float facing = mix(1.0, max(dot(normal, normalize(toDark)), 0.0), uDarkParams[di].z);
+      gl_FragColor.rgb = mix(gl_FragColor.rgb, uDarkColor[di], clamp(uDarkParams[di].x * atten * facing, 0.0, 1.0));
+    }
+  }`;
+
 /// Patches a lit material's lights chunk. Applied to the model and the ground — the only lit
 /// materials in the scene (gizmos and arrows are unlit).
 function applyStudioShaderPatches(material) {
@@ -1335,6 +1353,10 @@ function applyStudioShaderPatches(material) {
         shader.uniforms.uLockedCamPosView = { value: new THREE.Vector3() };
         shader.uniforms.uShadowTint = { value: new THREE.Color(shadowTintColor) };
         shader.uniforms.uShadowStrength = { value: shadowStrength };
+        shader.uniforms.uDarkCount = { value: 0 };
+        shader.uniforms.uDarkPosView = { value: [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()] };
+        shader.uniforms.uDarkColor = { value: [new THREE.Color(), new THREE.Color(), new THREE.Color(), new THREE.Color()] };
+        shader.uniforms.uDarkParams = { value: [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()] };
 
         // The targets live inside lights_fragment_begin, which is still an unexpanded
         // #include at this point — expand that one chunk and patch the expansion.
@@ -1352,13 +1374,15 @@ function applyStudioShaderPatches(material) {
             .replace('#include <lights_fragment_begin>', chunk)
             .replace('void main() {',
                 'uniform float uSpecLock;\nuniform vec3 uLockedCamPosView;\n' +
-                'uniform vec3 uShadowTint;\nuniform float uShadowStrength;\nvoid main() {');
+                'uniform vec3 uShadowTint;\nuniform float uShadowStrength;\n' +
+                'uniform int uDarkCount;\nuniform vec3 uDarkPosView[4];\nuniform vec3 uDarkColor[4];\nuniform vec3 uDarkParams[4];\nvoid main() {')
+            .replace('#include <tonemapping_fragment>', DARK_FRAGMENT + '\n\t#include <tonemapping_fragment>');
 
         material.userData.studioShader = shader;
     };
-    // Without a distinct key three.js reuses the unpatched program compiled for other
-    // materials of the same class.
-    material.customProgramCacheKey = () => 'studio-patch-v1';
+    // Without a distinct key three.js reuses the unpatched program compiled for other materials of the
+    // same class. Bump the version whenever the injected code changes so old programs aren't reused.
+    material.customProgramCacheKey = () => 'studio-patch-v2';
     return material;
 }
 
@@ -1367,6 +1391,11 @@ function applyStudioShaderPatches(material) {
 /// world-space view direction constant while the live camera orbits.
 function syncStudioUniforms() {
     _lockedCamView.copy(specLock.camPos).applyMatrix4(camera.matrixWorldInverse);
+    // Enabled dark sources (max 4), fed to the shader in VIEW space like the locked-camera position.
+    const darks = [];
+    for (const entry of lights.values()) {
+        if (entry.dark && entry.enabled) { darks.push(entry); if (darks.length === 4) break; }
+    }
     for (const material of [mesh?.material, ground?.material]) {
         const shader = material?.userData?.studioShader;
         if (!shader) continue;
@@ -1374,6 +1403,15 @@ function syncStudioUniforms() {
         shader.uniforms.uLockedCamPosView.value.copy(_lockedCamView);
         shader.uniforms.uShadowTint.value.set(shadowTintColor);
         shader.uniforms.uShadowStrength.value = shadowStrength;
+        if (shader.uniforms.uDarkCount) {
+            shader.uniforms.uDarkCount.value = darks.length;
+            for (let i = 0; i < darks.length; i++) {
+                _darkView.copy(darks[i].gizmo.position).applyMatrix4(camera.matrixWorldInverse);
+                shader.uniforms.uDarkPosView.value[i].copy(_darkView);
+                shader.uniforms.uDarkColor.value[i].set(darks[i].color);
+                shader.uniforms.uDarkParams.value[i].set(darks[i].uiIntensity, darks[i].darkRange, darks[i].darkWrap);
+            }
+        }
     }
     // Frozen-ink contour on the cel material: re-express the locked world directions in the CURRENT
     // view space each frame (they meet the view-space normal in the shader), so the marks stay glued
@@ -1871,9 +1909,11 @@ export function addLight(type, options) {
 
     const entry = {
         type, gizmo,
-        color: options?.color ?? '#ffffff',
+        // A dark source reuses `color` as its DARKNESS TINT — it must default DARK (a deep violet
+        // black), or a white default would mix toward white and brighten instead of darken.
+        color: options?.color ?? (options?.dark ? '#0a0512' : '#ffffff'),
         farColor: type === 'point' ? (options?.farColor ?? null) : null,
-        uiIntensity: options?.intensity ?? 1.0,
+        uiIntensity: options?.intensity ?? (options?.dark ? 1.6 : 1.0),
         decay: clampDecay(options?.decay),
         gradientStart: clampGradientStart(options?.gradientStart),
         bounceStrength: Math.min(1, Math.max(0, options?.bounceStrength ?? 0)),
@@ -1884,7 +1924,12 @@ export function addLight(type, options) {
         // A glow-region light is anchored to a painted region: its position/colour derive from the
         // region (recomputed when painting changes) and the region's surface renders emissive.
         regionSource: type === 'point' ? (options?.regionSource ?? null) : null,
-        enabled: options?.enabled !== false // switched off but kept: the dimmed handle stays put
+        enabled: options?.enabled !== false, // switched off but kept: the dimmed handle stays put
+        // A DARK source adds no real light — it SUBTRACTS in the studio shader (radiates gloom),
+        // reusing `color` as the darkness tint and `uiIntensity` as strength, plus its own radius/wrap.
+        dark: !!options?.dark,
+        darkRange: Math.max(1, options?.darkRange ?? Math.max(60, modelRadius * 2)),
+        darkWrap: Math.min(1, Math.max(0, options?.darkWrap ?? 0.5))
     };
     entry.gizmo.scale.setScalar(1 + entry.size / 8); // the handle hints at the source size
     // A region light ALWAYS anchors from the mask — the painted area, not a saved x/y/z, is its
@@ -1894,7 +1939,15 @@ export function addLight(type, options) {
     // no-ops and setRegions → refreshRegionLights re-anchors when it arrives.
     if (entry.regionSource !== null) anchorRegionLight(entry);
     lights.set(id, entry); // register FIRST: mountLights budgets casters across the whole map
-    if (entry.enabled) mountLights(entry);
+    if (entry.dark) {
+        // Place a fresh dark source between the camera and the model so its gloom lands on the visible
+        // side straight away (a point light's default up-and-to-the-side spot would hide the effect).
+        if (options?.x === undefined && camera && modelRadius) {
+            clampHandle(entry.gizmo.position.copy(camera.position).setLength(modelRadius * 1.15));
+        }
+        entry.lights = []; // dark sources mount no Three.js light — they subtract in the shader
+    }
+    else if (entry.enabled) mountLights(entry);
     else entry.lights = [];
     applyLightOrbLook(entry);
     syncGlowingSlots();
@@ -2137,6 +2190,14 @@ function syncGlowingSlots() {
 /// switched-off light keeps a dim ghost so it can still be selected and moved.
 function applyLightOrbLook(entry) {
     const material = entry.gizmo.material;
+    if (entry.dark) {
+        // A void marker: a dim violet orb so the (near-black) dark source stays visible and clickable.
+        material.color.set(entry.enabled ? '#8a3fb0' : '#432a52');
+        material.toneMapped = false;
+        material.transparent = true;
+        material.opacity = entry.enabled ? 0.9 : 0.4;
+        return;
+    }
     if (entry.enabled) {
         material.color.set(entry.color).multiplyScalar(1 + entry.uiIntensity * 1.5);
         material.toneMapped = true; // the tone mapper rolls the hot core off like a real emitter
@@ -2154,6 +2215,7 @@ export function updateLight(id, update) {
     const entry = lights.get(id);
     if (!entry) return;
     captureUndo('update:' + id, true);
+    invalidate();
 
     if (update.color !== undefined) entry.color = update.color;
     if (update.farColor !== undefined) entry.farColor = entry.type === 'point' ? update.farColor : null;
@@ -2167,6 +2229,8 @@ export function updateLight(id, update) {
         entry.gizmo.scale.setScalar(1 + entry.size / 8);
     }
     if (update.shadowGuard !== undefined) entry.shadowGuard = Math.min(3, Math.max(0, update.shadowGuard));
+    if (update.darkRange !== undefined) entry.darkRange = Math.max(1, update.darkRange);
+    if (update.darkWrap !== undefined) entry.darkWrap = Math.min(1, Math.max(0, update.darkWrap));
     if (update.enabled !== undefined) { entry.enabled = !!update.enabled; syncGlowingSlots(); }
     if (update.x !== undefined) clampHandle(entry.gizmo.position.set(update.x, update.y, update.z));
     applyLightOrbLook(entry); // colour/intensity/enabled all feed the orb's glow
@@ -2174,6 +2238,9 @@ export function updateLight(id, update) {
     // A glow region's SURFACE brightness follows its light's intensity — rebake the encoded
     // gain (aRegionSurf.w band) so dragging the slider visibly brightens/dims the glow.
     if (entry.regionSource !== null && update.intensity !== undefined && regionIndex) repaintColors();
+
+    // Dark sources own no mounted lights — the shader reads their state each frame; nothing to rebuild.
+    if (entry.dark) return;
 
     // Rebuild rather than mutate: color/decay/gradient changes can change the NUMBER of
     // underlying lights, and ≤4 rig lights make this trivially cheap.
@@ -2218,7 +2285,10 @@ export function cloneLight(id) {
         gradientStart: entry.gradientStart,
         bounceStrength: entry.bounceStrength,
         size: entry.size,
-        shadowGuard: entry.shadowGuard
+        shadowGuard: entry.shadowGuard,
+        dark: entry.dark,
+        darkRange: entry.darkRange,
+        darkWrap: entry.darkWrap
     });
     selectLight(newId);
     return newId;
@@ -2264,6 +2334,9 @@ export function getLightsJson() {
             size: entry.size,
             shadowGuard: entry.shadowGuard,
             regionSource: entry.regionSource,
+            dark: entry.dark,
+            darkRange: entry.darkRange,
+            darkWrap: entry.darkWrap,
             enabled: entry.enabled,
             selected: id === selectedLightId
         });
